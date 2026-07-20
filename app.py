@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import streamlit as st
 from docforge.converter import DocForge, ConversionResult
-from docforge.llm_enhancer import LLMEnhancer
+from docforge.llm_enhancer import LLMEnhancer, OllamaServiceManager
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -245,6 +245,51 @@ with st.sidebar:
                 st.warning("⚠️ Ollama not detected — make sure it's running")
         except Exception:
             st.warning("⚠️ Could not check Ollama status")
+
+        # ── Ollama Service Management ──
+        st.markdown("#### 🔧 Ollama Service")
+        ollama_mgr = OllamaServiceManager(host=llm_host or "http://localhost:11434")
+
+        # Show current status
+        with st.expander("📋 Ollama Status", expanded=False):
+            ollama_status = ollama_mgr.status()
+            if ollama_status["running"]:
+                st.success(f"🟢 Running  ·  PID: {ollama_status.get('pid', '?')}")
+                if ollama_status.get("models"):
+                    st.write("**Models:** " + ", ".join(f"`{m}`" for m in ollama_status["models"]))
+                if ollama_status.get("gpu"):
+                    st.info(f"🎮 GPU active  ·  {ollama_status.get('memory_mb', 0):.0f} MiB VRAM")
+                else:
+                    st.caption("CPU mode (no GPU detected)")
+            else:
+                st.error("🔴 Not running")
+
+        # Control buttons
+        ollama_col1, ollama_col2, ollama_col3 = st.columns(3)
+        with ollama_col1:
+            if st.button("▶️ Start", key="ollama_start", use_container_width=True):
+                result = ollama_mgr.start(model=llm_model)
+                if result["success"]:
+                    st.success(result["message"])
+                else:
+                    st.error(result["message"])
+                st.rerun()
+        with ollama_col2:
+            if st.button("⏹️ Stop", key="ollama_stop", use_container_width=True):
+                result = ollama_mgr.stop()
+                if result["success"]:
+                    st.success(result["message"])
+                else:
+                    st.error(result["message"])
+                st.rerun()
+        with ollama_col3:
+            if st.button("🔄 Restart", key="ollama_restart", use_container_width=True):
+                result = ollama_mgr.restart(model=llm_model)
+                if result["success"]:
+                    st.success(result["message"])
+                else:
+                    st.error(result["message"])
+                st.rerun()
 
     elif llm_provider == "gemini":
         st.markdown(

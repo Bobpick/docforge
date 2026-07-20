@@ -33,6 +33,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 import click
 
 from docforge.converter import DocForge, ConversionResult
+from docforge.llm_enhancer import OllamaServiceManager
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -257,6 +258,80 @@ def formats():
         click.echo(f"  {click.style(cat.upper(), fg='cyan', bold=True):12s} {ext_list}")
 
     click.echo()
+
+
+@cli.group()
+def ollama():
+    """Manage the Ollama LLM service (start, stop, restart, status)."""
+    pass
+
+
+@ollama.command()
+@click.option("--host", default="http://localhost:11434", help="Ollama host URL")
+def status(host):
+    """Check Ollama service status."""
+    mgr = OllamaServiceManager(host=host)
+    info = mgr.status()
+
+    if info["running"]:
+        click.echo(click.style("  🟢 Ollama is running", fg="green", bold=True))
+        if info.get("pid"):
+            click.echo(f"  PID: {info['pid']}")
+        if info.get("models"):
+            click.echo(f"  Models: {', '.join(info['models'])}")
+        if info.get("gpu"):
+            click.echo(f"  GPU: Yes ({info.get('memory_mb', 0):.0f} MiB VRAM)")
+        else:
+            click.echo("  GPU: No (CPU mode)")
+    else:
+        click.echo(click.style("  🔴 Ollama is not running", fg="red", bold=True))
+        click.echo("  Start with: docforge ollama start")
+
+
+@ollama.command()
+@click.option("--host", default="http://localhost:11434", help="Ollama host URL")
+@click.option("--model", default=None, help="Model to pre-load (e.g. cogito:14b)")
+def start(host, model):
+    """Start the Ollama service."""
+    mgr = OllamaServiceManager(host=host)
+    result = mgr.start(model=model)
+
+    if result["success"]:
+        click.echo(click.style(f"  ✅ {result['message']}", fg="green", bold=True))
+        if result.get("models"):
+            click.echo(f"  Models: {', '.join(result['models'])}")
+    else:
+        click.echo(click.style(f"  ❌ {result['message']}", fg="red", bold=True))
+        sys.exit(1)
+
+
+@ollama.command()
+@click.option("--host", default="http://localhost:11434", help="Ollama host URL")
+def stop(host):
+    """Stop the Ollama service (frees GPU/RAM)."""
+    mgr = OllamaServiceManager(host=host)
+    result = mgr.stop()
+
+    if result["success"]:
+        click.echo(click.style(f"  ✅ {result['message']}", fg="green", bold=True))
+    else:
+        click.echo(click.style(f"  ❌ {result['message']}", fg="red", bold=True))
+        sys.exit(1)
+
+
+@ollama.command()
+@click.option("--host", default="http://localhost:11434", help="Ollama host URL")
+@click.option("--model", default=None, help="Model to pre-load after restart")
+def restart(host, model):
+    """Restart the Ollama service."""
+    mgr = OllamaServiceManager(host=host)
+    result = mgr.restart(model=model)
+
+    if result["success"]:
+        click.echo(click.style(f"  ✅ {result['message']}", fg="green", bold=True))
+    else:
+        click.echo(click.style(f"  ❌ {result['message']}", fg="red", bold=True))
+        sys.exit(1)
 
 
 # ──────────────────────────────────────────────────────────────────────

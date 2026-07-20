@@ -11,6 +11,8 @@ runs locally. No API key needed — just install Ollama and pull a model.
 import os
 import re
 import json
+import signal
+import subprocess
 import urllib.request
 import urllib.error
 from typing import Optional, Dict, Any
@@ -238,6 +240,220 @@ class OpenAICompatibleProvider(LLMProvider):
                 return True
         except Exception:
             return False
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Ollama service management
+# ──────────────────────────────────────────────────────────────────────
+
+class OllamaServiceManager:
+    """Manage the Ollama service lifecycle — start, stop, restart, status.
+
+    This is useful for batch processing where you want to:
+    - Stop Ollama to free GPU/RAM during non-LLM conversion steps
+    - Restart Ollama when LLM enhancement is needed
+    - Recover from stuck/crashed Ollama processes
+    """
+
+    def __init__(self, host: str = "http://localhost:11434"):
+        self.host = host.rstrip("/")
+
+    def status(self) -> Dict[str, Any]:
+        """Get current Ollama service status.
+
+        Returns:
+            Dict with keys: running (bool), models (list), pid (int|None),
+            gpu (bool), memory_mb (float|None)
+        """
+        info: Dict[str, Any] = {
+            "running": False,
+            "models": [],
+            "pid": None,
+            "gpu": False,
+            "memory_mb": None,
+        }
+
+        # Check if Ollama is responding
+        try:
+            req = urllib.request.Request(
+                f"{self.host}/api/tags",
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                info["running"] = True
+                info["models"] = [m["name"] for m in data.get("models", [])]
+        except Exception:
+            pass
+
+        # Find Ollama process
+        try:
+            result = subprocess.run(
+                ["pgrep", "-f", "ollama"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                pids = result.stdout.strip().split("\n")
+                info["pid"] = int(pids[0])  # Primary PID
+        except Exception:
+            pass
+
+        # Check GPU usage (nvidia-smi)
+        try:
+            result = subprocess.run(
+                ["nvidia-smi",
+                 "--query-compute-apps=pid,used_memory",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0:
+                for line in result.stdout.strip().split("\n"):
+                    parts = line.strip().split(",")
+                    if len(parts) >= 2:
+                        pid_str = parts[0].strip()
+                        mem_str = parts[1].strip()
+                        try:
+                            pid = int(pid_str)
+                            mem = float(mem_str)
+                            if info["pid"] and pid == info["pid"]:
+                                info["gpu"] = True
+                                info["memory_mb"] = mem
+                        except (ValueError, TypeError):
+                            pass
+        except Exception:
+            pass
+
+        return info
+
+    def stop(self) -> Dict[str, Any]:
+        """Stop the Ollama service.
+
+        Returns:
+            Dict with keys: success (bool), message (str)
+        """
+        # First check if it's running
+        status = self.status()
+        if not status["running"] and not status["pid"]:
+            return {"success": True, "message": "Ollama is not running"}
+
+        # Try graceful shutdown via API first (Ollama doesn't have a
+        # shutdown endpoint, so we go straight to process management)
+
+        # Kill the ollama serve process
+        try:
+            result = subprocess.run(
+                ["pkill", "-f", "ollama serve"],
+                capture_output=True, text=True, timeout=10,
+            )
+        except Exception:
+            pass
+
+        # Also kill any ollama runner processes (model inference)
+        try:
+            subprocess.run(
+                ["pkill", "-f", "ollama runner"],
+                capture_output=True, text=True, timeout=10,
+            )
+        except Exception:
+            pass
+
+        # Also try the main ollama process
+        try:
+            subprocess.run(
+                ["pkill", "-x", "ollama"],
+                capture_output=True, text=True, timeout=10,
+            )
+        except Exception:
+            pass
+
+        # Wait briefly and verify
+        import time
+        time.sleep(2)
+        new_status = self.status()
+        if not new_status["running"]:
+            return {"success": True, "message": "Ollama stopped successfully"}
+        else:
+            # Force kill
+            try:
+                subprocess.run(
+                    ["pkill", "-9", "-f", "ollama"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                time.sleep(1)
+                return {"success": True, "message": "Ollama force-stopped"}
+            except Exception as e:
+                return {"success": False, "message": f"Failed to stop Ollama: {e}"}
+
+    def start(self, model: Optional[str] = None) -> Dict[str, Any]:
+        """Start the Ollama service.
+
+        Args:
+            model: Optional model to pre-load (e.g. 'cogito:14b').
+
+        Returns:
+            Dict with keys: success (bool), message (str)
+        """
+        # Check if already running
+        status = self.status()
+        if status["running"]:
+            return {"success": True, "message": "Ollama is already running"}
+
+        # Start ollama serve in the background
+        try:
+            subprocess.Popen(
+                ["ollama", "serve"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except FileNotFoundError:
+            return {"success": False, "message": "Ollama not found. Install it from https://ollama.ai"}
+        except Exception as e:
+            return {"success": False, "message": f"Failed to start Ollama: {e}"}
+
+        # Wait for it to come up
+        import time
+        for attempt in range(30):  # 30 seconds max
+            time.sleep(1)
+            status = self.status()
+            if status["running"]:
+                break
+
+        if not status["running"]:
+            return {"success": False, "message": "Ollama failed to start within 30 seconds"}
+
+        # Pre-load model if specified
+        if model:
+            try:
+                subprocess.run(
+                    ["ollama", "run", model, "--keep-alive", "5m", ""],
+                    capture_output=True, text=True, timeout=120,
+                )
+            except Exception:
+                pass  # Model load failed but Ollama is running
+
+        return {
+            "success": True,
+            "message": f"Ollama started successfully{' (loaded ' + model + ')' if model else ''}",
+            "models": status.get("models", []),
+        }
+
+    def restart(self, model: Optional[str] = None) -> Dict[str, Any]:
+        """Stop and restart the Ollama service.
+
+        Args:
+            model: Optional model to pre-load after restart.
+
+        Returns:
+            Dict with keys: success (bool), message (str)
+        """
+        stop_result = self.stop()
+        # Always try to start, even if stop reported not running
+        start_result = self.start(model=model)
+        return {
+            "success": start_result["success"],
+            "message": f"Restart: stop=({stop_result['message']}), start=({start_result['message']})",
+        }
 
 
 # ──────────────────────────────────────────────────────────────────────
