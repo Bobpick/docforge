@@ -27,23 +27,50 @@ class ArtifactRemover:
             Cleaned markdown text.
         """
         lines = markdown.split("\n")
+
+        patent_print = self._looks_like_patent_print(markdown)
         
         # Strategy 1: Remove page number patterns
         lines = self._remove_page_numbers(lines)
         
         # Strategy 2: Remove repeated header/footer lines
-        lines = self._remove_repeated_lines(lines)
+        # Patent print-to-PDF repeats chrome on every page — more aggressive
+        lines = self._remove_repeated_lines(
+            lines, min_repetition=2 if patent_print else self.min_repetition
+        )
         
         # Strategy 3: Remove common artifact patterns
         lines = self._remove_artifact_patterns(lines)
         
         # Strategy 4: Clean up section-page artifacts (e.g., "Section Title .... 5")
         lines = self._remove_leader_dots(lines)
+
+        # Strategy 5: Collapse duplicate consecutive paragraphs (print chrome)
+        lines = self._collapse_duplicate_runs(lines)
+
+        # Strategy 6: Deduplicate identical markdown tables
+        result = "\n".join(lines)
+        result = self._dedupe_markdown_tables(result)
         
         # Clean up excessive blank lines
-        result = "\n".join(lines)
         result = re.sub(r'\n{3,}', '\n\n', result)
         return result.strip()
+
+    @staticmethod
+    def _looks_like_patent_print(text: str) -> bool:
+        signals = 0
+        for needle in (
+            "patents.google.com",
+            "Find Prior Art",
+            "Family To Family Citations",
+            "Cited by examiner",
+            "Patent Citations",
+            "Non-Patent Citations",
+            "Download PDF",
+        ):
+            if needle.lower() in text.lower():
+                signals += 1
+        return signals >= 2
 
     def _remove_page_numbers(self, lines: list) -> list:
         """Remove standalone page numbers."""
@@ -68,36 +95,65 @@ class ArtifactRemover:
                 cleaned.append(line)
         return cleaned
 
-    def _remove_repeated_lines(self, lines: list) -> list:
+    def _remove_repeated_lines(
+        self, lines: list, min_repetition: Optional[int] = None
+    ) -> list:
         """Remove lines that repeat across many 'pages' (heuristic).
         
         In markdown converted from multi-page documents, page breaks may be
         represented by horizontal rules or blank lines. We look for lines that
         appear many times and are short (typical of headers/footers).
         """
+        threshold = min_repetition if min_repetition is not None else self.min_repetition
         line_counts = Counter(lines)
         
         cleaned = []
         for line in lines:
             stripped = line.strip()
-            # Keep lines that are:
-            # - Empty (preserve spacing)
-            # - Don't repeat too many times
-            # - Are long enough to be content
-            # - Are structural markdown
             if not stripped:
                 cleaned.append(line)
                 continue
             
             count = line_counts.get(line, 1)
-            is_short = len(stripped) < 80
-            is_repeated = count >= self.min_repetition
+            is_short = len(stripped) < 100
+            is_repeated = count >= threshold
             
             if is_repeated and is_short and not self._is_structural(stripped):
                 continue  # Skip this artifact
             
             cleaned.append(line)
         return cleaned
+
+    def _collapse_duplicate_runs(self, lines: list) -> list:
+        """Drop consecutive identical non-empty lines (print header spam)."""
+        cleaned = []
+        prev = None
+        for line in lines:
+            stripped = line.strip()
+            if stripped and stripped == prev and not self._is_structural(stripped):
+                continue
+            cleaned.append(line)
+            prev = stripped if stripped else prev
+            if not stripped:
+                prev = None  # blank line resets run tracking for paragraphs
+        return cleaned
+
+    @staticmethod
+    def _dedupe_markdown_tables(markdown: str) -> str:
+        """Keep first copy of each identical markdown table block."""
+        from hashlib import md5
+
+        blocks = re.split(r"(\n{2,})", markdown)
+        seen = set()
+        out = []
+        for block in blocks:
+            if block.startswith("|") and "\n|" in block:
+                sig = md5(re.sub(r"\s+", " ", block.strip()).lower().encode()).hexdigest()
+                if sig in seen:
+                    continue
+                seen.add(sig)
+            out.append(block)
+        return "".join(out)
 
     def _is_structural(self, line: str) -> bool:
         """Check if a line is structural markdown that shouldn't be removed."""
@@ -146,18 +202,34 @@ class ArtifactRemover:
             r'(?i)^\s*Privacy\s+Policy\s*$',
             r'(?i)^\s*Help\s*$',
             r'(?i)^\s*View\s+\d+\s+more\s+classifications?\s*$',
-            r'(?i)^\s*\*\s*Cited\s+by\s+examiner.*$',
+            r'(?i)^\s*\*?\s*Cited\s+by\s+examiner.*$',
             r'(?i)^\s*Family\s+To\s+Family\s+Citations\s*$',
             r'(?i)^\s*Data\s+provided\s+by\b.*$',
+            r'(?i)^\s*Patent\s+Citations\s*$',
+            r'(?i)^\s*Non[- ]Patent\s+Citations\s*$',
+            r'(?i)^\s*Cited\s+By\s*$',
+            r'(?i)^\s*Classifications\s*$',
+            r'(?i)^\s*Legal\s+Events\s*$',
+            r'(?i)^\s*Concepts\s*$',
+            r'(?i)^\s*Worldwide\s+applications\s*$',
+            r'(?i)^\s*Discuss\s*$',
+            r'(?i)^\s*Add\s+to\s+list\s*$',
+            r'(?i)^\s*Google\s+Patents\s*$',
+            r'(?i)^\s*Advanced\s+search\s*$',
+            r'(?i)^\s*My\s+account\s*$',
+            r'(?i)^\s*Sign\s+in\s*$',
             # Google Patents page counters
             r'^\s*\d+\s+of\s+\d+\s*$',
             # Patent document patterns
             r'(?i)^\s*Sheet\s+\d+\s+of\s+\d+\s*$',
-            r'^\s*US\d+[A-Z]\s*$',  # Patent number standalone
+            r'^\s*US\d+[A-Z]\d?\s*$',  # Patent number standalone
+            r'(?i)^\s*United\s+States\s+Patent\s*$',
+            r'(?i)^\s*\(\d{2}\)\s*Patent\s+No\.\s*$',
             # Web page URL footers
             r'^\s*https?://\S+\s*$',
             # Page indicators from print
-            r'^\s*\d{1,2}/\d{1,2}/\d{2,4},?\s*\d{1,2}:\d{2}\s*$',
+            r'^\s*\d{1,2}/\d{1,2}/\d{2,4},?\s*\d{1,2}:\d{2}(:\d{2})?\s*(AM|PM)?\s*$',
+            r'(?i)^\s*\d{1,2}/\d{1,2}/\d{2,4},?\s*.*patents\.google\.com.*$',
         ]
         
         cleaned = []
