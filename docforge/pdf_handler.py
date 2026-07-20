@@ -12,7 +12,8 @@ from .utils import (
     clean_whitespace,
 )
 from .table_utils import (
-    TABLE_SETTINGS,
+    TABLE_SETTINGS_STRICT,
+    TABLE_SETTINGS_TEXT,
     normalize_table,
     pick_best_table,
     score_table,
@@ -24,6 +25,12 @@ from .text_cleanup import (
     collapse_spaced_text,
     looks_like_code,
     looks_like_drawing_label,
+)
+from .garbage_filter import (
+    filter_tables,
+    clean_extracted_markdown,
+    clean_section_content,
+    is_garbage_table,
 )
 
 
@@ -83,16 +90,25 @@ class PDFHandler:
 
         doc.close()
 
-        # ---- Phase 3: Post-processing ----
+        # ---- Phase 3: Post-processing (garbage-first) ----
         all_sections = [s for s in all_sections if not self._is_noise_section(s)]
-
-        # Drop near-duplicate tables (Google Patents citation chrome x5)
         all_sections = self._dedupe_table_sections(all_sections)
+
+        # Drop shredded / empty / letter-soup tables from structured output
+        cleaned_sections: List[Dict[str, Any]] = []
+        for s in all_sections:
+            s2 = clean_section_content(s)
+            if s2 is not None:
+                cleaned_sections.append(s2)
+        all_sections = cleaned_sections
 
         markdown = clean_whitespace("\n\n".join(md_parts))
         markdown = self._dedupe_markdown_tables(markdown)
+        # Aggressive: strip garbage MD tables, defrag bold, reflow wraps
+        markdown = clean_extracted_markdown(markdown)
         markdown = fix_ligatures_and_ocr(markdown)
         markdown = collapse_spaced_text(markdown)
+        markdown = clean_whitespace(markdown)
 
         for s in all_sections:
             if "content" in s and isinstance(s["content"], str):
@@ -263,9 +279,10 @@ class PDFHandler:
                 if not best:
                     continue
                 headers, rows = best
+                if is_garbage_table(headers, rows):
+                    continue
                 entry = {"headers": headers, "rows": rows, "bbox": None}
                 if i in table_map:
-                    # Keep whichever scores higher overall
                     existing_best = max(
                         (score_table(t["headers"], t["rows"]) for t in table_map[i]),
                         default=-1,
@@ -277,49 +294,67 @@ class PDFHandler:
         except Exception:
             pass
 
+        # Final garbage sweep per page
+        for i in list(table_map.keys()):
+            table_map[i] = filter_tables(table_map[i])
+            if not table_map[i]:
+                del table_map[i]
+
         return table_map
 
     def _extract_page_tables_pdfplumber(self, page) -> List[Dict]:
-        """Try several pdfplumber settings; pick non-overlapping best tables."""
-        all_candidates: List[Tuple[List[str], List[List[str]]]] = []
+        """Multi-method table extract: strict lines first, text fallback, then filter."""
+        from .table_utils import tables_are_duplicates
 
-        for settings in TABLE_SETTINGS:
-            try:
-                if settings is None:
-                    tables = page.extract_tables() or []
-                else:
-                    tables = page.extract_tables(table_settings=settings) or []
-            except Exception:
-                continue
-            for table in tables:
-                norm = normalize_table(table)
-                if norm:
-                    all_candidates.append(norm)
+        def _collect(settings_list) -> List[Tuple[List[str], List[List[str]]]]:
+            found: List[Tuple[List[str], List[List[str]]]] = []
+            for settings in settings_list:
+                try:
+                    if settings is None:
+                        tables = page.extract_tables() or []
+                    else:
+                        tables = page.extract_tables(table_settings=settings) or []
+                except Exception:
+                    continue
+                for table in tables:
+                    norm = normalize_table(table)
+                    if not norm:
+                        continue
+                    headers, rows = norm
+                    # Drop garbage immediately — never promote letter-soup
+                    if is_garbage_table(headers, rows):
+                        continue
+                    found.append((headers, rows))
+            return found
+
+        # Method 1: ruled / default strategies
+        all_candidates = _collect(TABLE_SETTINGS_STRICT)
+        # Method 2: text clustering only if nothing usable
+        if not all_candidates:
+            all_candidates = _collect(TABLE_SETTINGS_TEXT)
 
         if not all_candidates:
             return []
 
-        # Greedy: take best, then next non-duplicate, etc.
         remaining = list(all_candidates)
         selected: List[Dict] = []
-        from .table_utils import tables_are_duplicates
-
         while remaining:
             best = pick_best_table(remaining)
             if not best:
                 break
             headers, rows = best
-            selected.append({"headers": headers, "rows": rows, "bbox": None})
-            # Remove duplicates of this table from remaining
             remaining = [
                 c
                 for c in remaining
                 if not tables_are_duplicates(c, best, threshold=0.75)
             ]
-            if len(selected) >= 8:
+            if is_garbage_table(headers, rows):
+                continue
+            selected.append({"headers": headers, "rows": rows, "bbox": None})
+            if len(selected) >= 6:
                 break
 
-        return selected
+        return filter_tables(selected)
 
     # Back-compat alias
     def _extract_tables_pdfplumber(
@@ -486,10 +521,13 @@ class PDFHandler:
                 md_lines.append(stripped)
                 sections.append({"type": "paragraph", "content": stripped})
 
-        # Append tables (multi-strategy extraction)
-        for table in tables:
+        # Append only high-quality tables (garbage already filtered upstream;
+        # re-check in case of reconstruct edge cases)
+        for table in filter_tables(tables):
             headers = [h or "" for h in table["headers"]]
             rows = [[c or "" for c in r] for r in table["rows"]]
+            if is_garbage_table(headers, rows):
+                continue
             table_md = format_table_md(headers, rows)
             md_lines.append(table_md)
             sections.append(format_table_json(headers, rows))

@@ -6,9 +6,9 @@ import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
-# pdfplumber strategies to try (order does not matter; we score results)
-TABLE_SETTINGS: List[Optional[Dict[str, Any]]] = [
-    None,  # library default
+# pdfplumber strategies — prefer ruled (lines) tables.
+# Aggressive text-clustering is opt-in only: it shreds multi-column papers.
+TABLE_SETTINGS_STRICT: List[Optional[Dict[str, Any]]] = [
     {
         "vertical_strategy": "lines",
         "horizontal_strategy": "lines",
@@ -16,38 +16,41 @@ TABLE_SETTINGS: List[Optional[Dict[str, Any]]] = [
         "snap_tolerance": 3,
     },
     {
+        "vertical_strategy": "lines_strict",
+        "horizontal_strategy": "lines_strict",
+        "intersection_tolerance": 3,
+        "snap_tolerance": 3,
+    },
+    None,  # library default (often line-aware)
+    {
+        "vertical_strategy": "lines",
+        "horizontal_strategy": "text",
+        "min_words_horizontal": 2,
+        "intersection_tolerance": 5,
+    },
+]
+
+# Text strategies can help form PDFs but produce letter-soup on academic layouts.
+# Only used when strict pass finds nothing; results still pass is_garbage_table.
+TABLE_SETTINGS_TEXT: List[Optional[Dict[str, Any]]] = [
+    {
         "vertical_strategy": "text",
         "horizontal_strategy": "text",
-        "min_words_vertical": 1,
-        "min_words_horizontal": 1,
-        "text_tolerance": 3,
+        "min_words_vertical": 3,
+        "min_words_horizontal": 2,
         "text_x_tolerance": 3,
         "text_y_tolerance": 3,
     },
     {
-        "vertical_strategy": "lines",
-        "horizontal_strategy": "text",
-        "min_words_horizontal": 1,
-        "intersection_tolerance": 5,
-    },
-    {
         "vertical_strategy": "text",
         "horizontal_strategy": "lines",
-        "min_words_vertical": 1,
+        "min_words_vertical": 3,
         "intersection_tolerance": 5,
     },
-    {
-        # Form-style SBIR budgets: loose text clustering
-        "vertical_strategy": "text",
-        "horizontal_strategy": "text",
-        "min_words_vertical": 2,
-        "min_words_horizontal": 1,
-        "text_x_tolerance": 5,
-        "text_y_tolerance": 2,
-        "snap_x_tolerance": 5,
-        "snap_y_tolerance": 3,
-    },
 ]
+
+# Backward-compatible name: strict first
+TABLE_SETTINGS: List[Optional[Dict[str, Any]]] = TABLE_SETTINGS_STRICT
 
 
 def clean_cell(value: Any) -> str:
@@ -83,7 +86,7 @@ def normalize_table(raw: Sequence[Sequence[Any]]) -> Optional[Tuple[List[str], L
 
 
 def score_table(headers: List[str], rows: List[List[str]]) -> float:
-    """Higher is better. Penalize 1-column form dumps and empty grids."""
+    """Higher is better. Penalize empty grids, 1-col dumps, and letter-shreds."""
     if not headers and not rows:
         return -100.0
 
@@ -91,34 +94,68 @@ def score_table(headers: List[str], rows: List[List[str]]) -> float:
     if width == 0:
         return -100.0
 
+    # Extreme width is almost never a real data table in our corpus
+    if width >= 16:
+        return -80.0
+
     all_rows = [headers] + rows
     lengths = [len(r) for r in all_rows]
     consistency = 1.0 - (max(lengths) - min(lengths)) / max(width, 1)
 
     cells = [c for r in all_rows for c in r]
-    nonempty = sum(1 for c in cells if c)
+    nonempty_cells = [c for c in cells if c]
+    nonempty = len(nonempty_cells)
     fill = nonempty / max(len(cells), 1)
 
-    # Prefer multi-column tables
-    col_score = min(width, 10) * 3.0
-    row_score = min(len(rows), 40) * 0.15
+    try:
+        from .garbage_filter import fragmentation_ratio as _frag_ratio
 
-    # Heavy penalty for single-column tables with many rows (form layout fail)
+        frag_ratio = _frag_ratio(headers, rows)
+    except Exception:
+        frag_ratio = 0.0
+
+    # Prefer modest multi-column tables (2–8 cols) with real content
+    if 2 <= width <= 8:
+        col_score = width * 2.5
+    elif width == 1:
+        col_score = 1.0
+    else:
+        col_score = max(0.0, 12.0 - (width - 8) * 1.5)  # taper off wide grids
+
+    row_score = min(len(rows), 40) * 0.2
+
     one_col_penalty = 0.0
     if width == 1 and len(rows) >= 2:
         one_col_penalty = 12.0 + min(len(rows), 20) * 0.5
 
-    # Bonus if header cells look like real labels
     header_bonus = 0.0
     if any(headers):
-        short_labels = sum(1 for h in headers if 1 <= len(h) <= 40)
-        header_bonus = short_labels * 0.4
+        # Real headers are short labels, not prose fragments
+        short_labels = sum(
+            1 for h in headers if (1 <= len(h) <= 40 and " " in h) or (2 <= len(h) <= 24)
+        )
+        header_bonus = min(short_labels, width) * 0.5
 
-    # Penalty if almost everything is empty
     if fill < 0.15:
         return -50.0
+    if width >= 6 and frag_ratio >= 0.45:
+        return -60.0
 
-    return col_score + row_score + consistency * 4.0 + fill * 6.0 + header_bonus - one_col_penalty
+    frag_penalty = frag_ratio * (30.0 if width >= 6 else 10.0)
+    wide_empty_penalty = 0.0
+    if width >= 8 and fill < 0.40:
+        wide_empty_penalty = 15.0
+
+    return (
+        col_score
+        + row_score
+        + consistency * 4.0
+        + fill * 8.0
+        + header_bonus
+        - one_col_penalty
+        - frag_penalty
+        - wide_empty_penalty
+    )
 
 
 def split_aligned_cell(cell: str) -> List[str]:
