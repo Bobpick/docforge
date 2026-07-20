@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import streamlit as st
 from docforge.converter import DocForge
+from docforge.llm_enhancer import LLMEnhancer
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -29,7 +30,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Custom CSS for a polished look
+# Custom CSS
 st.markdown("""
 <style>
     .main-header { font-size: 2.5rem; font-weight: 700; margin-bottom: 0; }
@@ -48,6 +49,13 @@ st.markdown("""
     .stat-label  { font-size: 0.8rem; color: #8b949e; }
     .image-grid  { display: flex; flex-wrap: wrap; gap: 12px; }
     .image-grid img { max-height: 200px; border-radius: 6px; border: 1px solid #30363d; }
+    .provider-badge {
+        display: inline-block; padding: 2px 10px; border-radius: 12px;
+        font-size: 0.8rem; font-weight: 600;
+    }
+    .badge-ollama { background: #1a3a2a; color: #4ade80; }
+    .badge-gemini { background: #1a2a3a; color: #60a5fa; }
+    .badge-openai { background: #2a1a3a; color: #c084fc; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -71,27 +79,85 @@ with st.sidebar:
     )
 
     st.markdown("---")
-    st.markdown("### 🤖 LLM Enhancement (Gemini)")
+    st.markdown("### 🤖 LLM Enhancement")
 
     use_llm = st.checkbox(
         "Enable LLM cleanup",
         value=False,
-        help="Use Google Gemini to clean up tables, fix OCR errors, and improve formatting.",
+        help="Use an LLM to clean up tables, fix OCR errors, and improve formatting.",
     )
 
-    llm_api_key = st.text_input(
-        "Google AI API Key",
-        type="password",
-        value=os.environ.get("GOOGLE_API_KEY", ""),
-        help="Your Google AI API key for Gemini. Also set via GOOGLE_API_KEY env var.",
-    )
-
-    llm_model = st.selectbox(
-        "Gemini Model",
-        ["gemini-2.0-flash", "gemini-2.5-flash", "gemini-2.5-pro"],
+    llm_provider = st.selectbox(
+        "LLM Provider",
+        ["ollama", "gemini", "openai-compat"],
         index=0,
-        help="Select which Gemini model to use for enhancement.",
+        help="Ollama runs locally (free, private). Gemini is cloud-based. "
+             "OpenAI-compat works with LM Studio, vLLM, etc.",
     )
+
+    # Provider-specific settings
+    if llm_provider == "ollama":
+        st.markdown(
+            '<span class="provider-badge badge-ollama">🦙 Ollama — Local & Free</span>',
+            unsafe_allow_html=True,
+        )
+        llm_model = st.text_input(
+            "Model",
+            value=os.environ.get("DOCFORGE_OLLAMA_MODEL", "cogito:14b"),
+            help="Ollama model name. Pull with: ollama pull cogito:14b",
+        )
+        llm_host = st.text_input(
+            "Ollama Host",
+            value=os.environ.get("OLLAMA_HOST", "http://localhost:11434"),
+            help="Ollama server URL.",
+        )
+        llm_api_key = None  # Not needed for Ollama
+
+        # Show available models if Ollama is running
+        try:
+            enhancer_check = LLMEnhancer(provider="ollama", model=llm_model, host=llm_host)
+            info = enhancer_check.get_provider_info()
+            if info["available"]:
+                st.success("✅ Ollama is running")
+                if info.get("models"):
+                    with st.expander(f"Available models ({len(info['models'])})"):
+                        for m in info["models"]:
+                            st.text(m)
+            else:
+                st.warning("⚠️ Ollama not detected — make sure it's running")
+        except Exception:
+            st.warning("⚠️ Could not check Ollama status")
+
+    elif llm_provider == "gemini":
+        st.markdown(
+            '<span class="provider-badge badge-gemini">✨ Gemini — Cloud</span>',
+            unsafe_allow_html=True,
+        )
+        llm_model = st.text_input(
+            "Model",
+            value="gemini-2.0-flash",
+            help="Gemini model name.",
+        )
+        llm_api_key = st.text_input(
+            "Google AI API Key",
+            type="password",
+            value=os.environ.get("GOOGLE_API_KEY", ""),
+            help="Your Google AI API key. Also set via GOOGLE_API_KEY env var.",
+        )
+        llm_host = None
+
+    else:  # openai-compat
+        st.markdown(
+            '<span class="provider-badge badge-openai">🔌 OpenAI-Compatible</span>',
+            unsafe_allow_html=True,
+        )
+        llm_model = st.text_input("Model", value="local-model")
+        llm_api_key = st.text_input("API Key", value="not-needed", type="password")
+        llm_host = st.text_input(
+            "API Base URL",
+            value="http://localhost:8080/v1",
+            help="Base URL for OpenAI-compatible API.",
+        )
 
     st.markdown("---")
     st.markdown(
@@ -115,27 +181,21 @@ st.markdown(
 uploaded_file = st.file_uploader(
     "Upload a document",
     type=["pdf", "docx", "doc", "pptx", "ppt", "png", "jpg", "jpeg", "tiff", "tif", "bmp", "webp", "gif"],
-    help="Drag and drop or click to browse. Supports PDF, Word, PowerPoint, and image files.",
+    help="Drag and drop or click to browse.",
 )
 
 if uploaded_file is not None:
     # Show file info
-    file_details = {
-        "Filename": uploaded_file.name,
-        "Size": f"{uploaded_file.size / 1024:.1f} KB",
-        "Type": uploaded_file.type or "unknown",
-    }
     col1, col2, col3 = st.columns(3)
     with col1:
-        st.info(f"📄 **{file_details['Filename']}**")
+        st.info(f"📄 **{uploaded_file.name}**")
     with col2:
-        st.info(f"💾 **{file_details['Size']}**")
+        st.info(f"💾 **{uploaded_file.size / 1024:.1f} KB**")
     with col3:
-        st.info(f"🏷️ **{file_details['Type']}**")
+        st.info(f"🏷️ **{uploaded_file.type or 'unknown'}**")
 
     # Convert button
     if st.button("🔄 Convert", type="primary", use_container_width=True):
-        # Write uploaded file to a temp location
         suffix = Path(uploaded_file.name).suffix
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             tmp.write(uploaded_file.getbuffer())
@@ -144,11 +204,12 @@ if uploaded_file is not None:
         output_dir = tempfile.mkdtemp()
 
         try:
-            # Build the converter with current settings
             forge = DocForge(
                 use_llm=use_llm,
-                llm_api_key=llm_api_key if llm_api_key else None,
+                llm_provider=llm_provider,
                 llm_model=llm_model,
+                llm_api_key=llm_api_key,
+                llm_host=llm_host,
                 remove_artifacts=remove_artifacts,
                 extract_images=extract_images,
             )
@@ -159,6 +220,12 @@ if uploaded_file is not None:
                 elapsed = time.time() - start
 
             st.success(f"✅ Conversion complete in {elapsed:.1f}s")
+
+            if use_llm and forge.llm_enhancer:
+                provider_info = forge.llm_enhancer.get_provider_info()
+                st.caption(
+                    f"🤖 LLM: {provider_info['provider']} / {provider_info.get('model', '?')}"
+                )
 
             # ── Stats ──
             stats = result.structured.get("stats", {})
@@ -183,8 +250,7 @@ if uploaded_file is not None:
                 st.markdown(
                     f'<div class="result-box">{_escape_html(result.markdown)}</div>',
                     unsafe_allow_html=True,
-                    )
-                # Also render the markdown
+                )
                 with st.expander("📖 Rendered Preview"):
                     st.markdown(result.markdown)
 
@@ -229,7 +295,6 @@ if uploaded_file is not None:
                         mime="application/json",
                         use_container_width=True,
                     )
-                # Individual images
                 if result.images:
                     images_dir = Path(output_dir) / "images"
                     for img in result.images:
@@ -248,7 +313,6 @@ if uploaded_file is not None:
                 st.exception(e)
 
         finally:
-            # Cleanup temp files
             try:
                 os.unlink(tmp_path)
             except OSError:

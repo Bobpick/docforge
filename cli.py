@@ -5,11 +5,15 @@ Usage:
     # Single file
     python cli.py convert report.pdf -o output/
 
+    # With Ollama (default LLM provider)
+    python cli.py convert messy.pdf --llm
+    python cli.py convert messy.pdf --llm --model llama3:8b
+
+    # With Gemini (cloud)
+    python cli.py convert messy.pdf --llm --provider gemini --api-key YOUR_KEY
+
     # Entire folder
     python cli.py batch documents/ -o converted/
-
-    # With LLM enhancement
-    python cli.py convert messy.pdf --llm --api-key YOUR_KEY
 
     # Recursive folder processing
     python cli.py batch docs/ -o out/ --recursive
@@ -74,6 +78,16 @@ def print_result_summary(result: ConversionResult, elapsed: float):
         click.echo(f"  🖼️  Images: {len(result.images)}")
 
 
+def get_default_model(provider: str) -> str:
+    """Get the default model for a provider."""
+    if provider == "ollama":
+        return os.environ.get("DOCFORGE_OLLAMA_MODEL", "cogito:14b")
+    elif provider == "gemini":
+        return "gemini-2.0-flash"
+    else:
+        return "local-model"
+
+
 # ──────────────────────────────────────────────────────────────────────
 # CLI commands
 # ──────────────────────────────────────────────────────────────────────
@@ -89,11 +103,14 @@ def cli():
 @click.option("-o", "--output-dir", default=None, help="Output directory (default: ./output/<filename>)")
 @click.option("--no-artifacts", is_flag=True, help="Keep headers, footers, page numbers")
 @click.option("--no-images", is_flag=True, help="Skip image extraction")
-@click.option("--llm", is_flag=True, help="Enable LLM (Gemini) enhancement")
-@click.option("--api-key", default=None, help="Google AI API key (or set GOOGLE_API_KEY)")
-@click.option("--model", default="gemini-2.0-flash", help="Gemini model name")
+@click.option("--llm", is_flag=True, help="Enable LLM enhancement")
+@click.option("--provider", type=click.Choice(["ollama", "gemini", "openai-compat"]), default="ollama",
+              help="LLM provider (default: ollama)")
+@click.option("--model", default=None, help="LLM model name (default: cogito:14b for ollama)")
+@click.option("--api-key", default=None, help="API key for cloud providers (Gemini)")
+@click.option("--ollama-host", default=None, help="Ollama host URL (default: http://localhost:11434)")
 @click.option("--quiet", "-q", is_flag=True, help="Suppress banner and summary")
-def convert(file_path, output_dir, no_artifacts, no_images, llm, api_key, model, quiet):
+def convert(file_path, output_dir, no_artifacts, no_images, llm, provider, model, api_key, ollama_host, quiet):
     """Convert a single document to Markdown and JSON."""
     if not quiet:
         print_banner()
@@ -103,17 +120,43 @@ def convert(file_path, output_dir, no_artifacts, no_images, llm, api_key, model,
         stem = Path(file_path).stem
         output_dir = str(Path("output") / stem)
 
+    # Resolve model default
+    if model is None:
+        model = get_default_model(provider)
+
     forge = DocForge(
         use_llm=llm,
-        llm_api_key=api_key,
+        llm_provider=provider,
         llm_model=model,
+        llm_api_key=api_key,
+        llm_host=ollama_host,
         remove_artifacts=not no_artifacts,
         extract_images=not no_images,
     )
 
-    if llm and not forge.is_llm_available():
-        click.echo(click.style("  ⚠️  LLM enhancement requested but not available. "
-                               "Set GOOGLE_API_KEY or pass --api-key.", fg="yellow"))
+    if llm:
+        if not forge.is_llm_available():
+            if provider == "ollama":
+                click.echo(click.style(
+                    "  ⚠️  Ollama not detected. Make sure it's running:\n"
+                    "     ollama serve\n"
+                    f"     ollama pull {model}", fg="yellow"))
+            elif provider == "gemini":
+                click.echo(click.style(
+                    "  ⚠️  Gemini not available. Set GOOGLE_API_KEY or pass --api-key.",
+                    fg="yellow"))
+            else:
+                click.echo(click.style(
+                    "  ⚠️  LLM provider not available. Check your configuration.",
+                    fg="yellow"))
+        else:
+            if not quiet:
+                provider_label = {
+                    "ollama": "🦙 Ollama",
+                    "gemini": "✨ Gemini",
+                    "openai-compat": "🔌 OpenAI-compat",
+                }.get(provider, provider)
+                click.echo(f"  🤖 LLM: {provider_label} / {model}")
 
     start = time.time()
     try:
@@ -139,17 +182,25 @@ def convert(file_path, output_dir, no_artifacts, no_images, llm, api_key, model,
 @click.option("--recursive", "-r", is_flag=True, help="Process subdirectories")
 @click.option("--no-artifacts", is_flag=True, help="Keep headers, footers, page numbers")
 @click.option("--no-images", is_flag=True, help="Skip image extraction")
-@click.option("--llm", is_flag=True, help="Enable LLM (Gemini) enhancement")
-@click.option("--api-key", default=None, help="Google AI API key (or set GOOGLE_API_KEY)")
-@click.option("--model", default="gemini-2.0-flash", help="Gemini model name")
-def batch(input_dir, output_dir, recursive, no_artifacts, no_images, llm, api_key, model):
+@click.option("--llm", is_flag=True, help="Enable LLM enhancement")
+@click.option("--provider", type=click.Choice(["ollama", "gemini", "openai-compat"]), default="ollama",
+              help="LLM provider (default: ollama)")
+@click.option("--model", default=None, help="LLM model name (default: cogito:14b for ollama)")
+@click.option("--api-key", default=None, help="API key for cloud providers")
+@click.option("--ollama-host", default=None, help="Ollama host URL")
+def batch(input_dir, output_dir, recursive, no_artifacts, no_images, llm, provider, model, api_key, ollama_host):
     """Batch-convert all supported documents in a directory."""
     print_banner()
 
+    if model is None:
+        model = get_default_model(provider)
+
     forge = DocForge(
         use_llm=llm,
-        llm_api_key=api_key,
+        llm_provider=provider,
         llm_model=model,
+        llm_api_key=api_key,
+        llm_host=ollama_host,
         remove_artifacts=not no_artifacts,
         extract_images=not no_images,
     )
@@ -157,6 +208,8 @@ def batch(input_dir, output_dir, recursive, no_artifacts, no_images, llm, api_ke
     click.echo(f"  📂 Input:  {click.style(input_dir, fg='cyan')}")
     click.echo(f"  📁 Output: {click.style(output_dir, fg='cyan')}")
     click.echo(f"  🔄 Recursive: {'Yes' if recursive else 'No'}")
+    if llm:
+        click.echo(f"  🤖 LLM: {provider} / {model}")
     click.echo()
 
     start = time.time()

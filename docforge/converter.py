@@ -108,27 +108,38 @@ class DocForge:
     def __init__(
         self,
         use_llm: bool = False,
+        llm_provider: str = "ollama",
+        llm_model: Optional[str] = None,
         llm_api_key: Optional[str] = None,
-        llm_model: str = "gemini-2.0-flash",
+        llm_host: Optional[str] = None,
+        # Legacy params kept for backward compatibility
         remove_artifacts: bool = True,
         extract_images: bool = True,
     ):
         """
         Args:
-            use_llm: Enable Gemini-based enhancement for tables & formatting.
-            llm_api_key: Google AI API key (or set GOOGLE_API_KEY env var).
-            llm_model: Gemini model name.
+            use_llm: Enable LLM-based enhancement for tables & formatting.
+            llm_provider: LLM provider — "ollama" (default), "gemini", or "openai-compat".
+            llm_model: Model name. Defaults: "cogito:14b" (ollama), "gemini-2.0-flash" (gemini).
+            llm_api_key: API key (Gemini only). Falls back to GOOGLE_API_KEY env var.
+            llm_host: Ollama host URL (default: http://localhost:11434).
             remove_artifacts: Remove headers, footers, page numbers.
             extract_images: Extract and save embedded images.
         """
         self.use_llm = use_llm
+        self.llm_provider = llm_provider
         self.remove_artifacts = remove_artifacts
         self.extract_images = extract_images
 
         self.artifact_remover = ArtifactRemover() if remove_artifacts else None
         self.llm_enhancer: Optional[LLMEnhancer] = None
         if use_llm:
-            self.llm_enhancer = LLMEnhancer(api_key=llm_api_key, model=llm_model)
+            self.llm_enhancer = LLMEnhancer(
+                provider=llm_provider,
+                model=llm_model,
+                api_key=llm_api_key,
+                host=llm_host,
+            )
 
     # ------------------------------------------------------------------
     # Public API
