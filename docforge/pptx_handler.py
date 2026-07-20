@@ -19,8 +19,9 @@ from .utils import (
 class PPTXHandler:
     """Convert PPTX files to Markdown and structured JSON."""
 
-    def __init__(self, extract_images: bool = True):
+    def __init__(self, extract_images: bool = True, extract_tables: bool = False):
         self.extract_images = extract_images
+        self.extract_tables = extract_tables
         self._seen_image_hashes: set = set()
 
     def convert(
@@ -103,8 +104,8 @@ class PPTXHandler:
                     md_lines.append(text_md)
                     sections.extend(text_sections)
 
-            # --- Tables ---
-            if shape.has_table:
+            # --- Tables (off by default) ---
+            if self.extract_tables and shape.has_table:
                 table_md, table_sec = self._process_table(shape.table)
                 if table_md.strip():
                     md_lines.append(table_md)
@@ -226,7 +227,7 @@ class PPTXHandler:
                     md_lines.append(text_md)
                     sections.extend(text_sections)
 
-            if shape.has_table:
+            if self.extract_tables and shape.has_table:
                 table_md, table_sec = self._process_table(shape.table)
                 if table_md.strip():
                     md_lines.append(table_md)

@@ -66,10 +66,17 @@ Hello world paragraph.
 
 Done.
 """
+    # Default policy: drop ALL tables
     cleaned = strip_garbage_markdown_tables(md)
     assert "Hello world" in cleaned
-    assert "Gain" in cleaned
+    assert "Gain" not in cleaned  # even "good" tables dropped
     assert "RMY" not in cleaned
+    assert "|" not in cleaned
+
+    # Opt-in quality filter only
+    selective = strip_garbage_markdown_tables(md, drop_all=False)
+    assert "Gain" in selective
+    assert "RMY" not in selective
 
 
 def test_defragment_bold():
@@ -95,5 +102,11 @@ def test_clean_pipeline_smoke():
     md = "**direction** **of** **arrival** (DoA)\n\n| A | B | C | D | E | F | G | H |\n| --- | --- | --- | --- | --- | --- | --- | --- |\n| a | b | c | d | e | f | g | h |\n"
     out = clean_extracted_markdown(md)
     assert "direction" in out
-    # shredded wide table should be gone or rare
-    assert out.count("|") < md.count("|")
+    # all tables stripped by default
+    assert "|" not in out
+
+
+def test_drop_all_tables_flag():
+    from docforge.garbage_filter import DROP_ALL_TABLES
+
+    assert DROP_ALL_TABLES is True

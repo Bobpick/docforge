@@ -15,14 +15,21 @@ from .utils import (
 class ImageHandler:
     """Convert image files (PNG, JPG, TIFF, etc.) to Markdown via OCR."""
 
-    def __init__(self, extract_images: bool = True, languages: List[str] = None):
+    def __init__(
+        self,
+        extract_images: bool = True,
+        languages: List[str] = None,
+        extract_tables: bool = False,
+    ):
         """
         Args:
             extract_images: Whether to include the source image in the output.
             languages: OCR languages (e.g. ['eng', 'fra']). Defaults to English.
+            extract_tables: Detect tables from OCR layout (default False).
         """
         self.extract_images = extract_images
         self.languages = languages or ["eng"]
+        self.extract_tables = extract_tables
         self._seen_image_hashes: set = set()
 
     def convert(
@@ -123,21 +130,21 @@ class ImageHandler:
             except Exception:
                 return ""
 
-        # Also try to extract structured data for table detection
-        try:
-            data = pytesseract.image_to_data(
-                img, lang=lang, output_type=pytesseract.Output.DICT
-            )
-            tables = self._detect_tables_in_ocr(data)
-            if tables:
-                # Append detected tables to the text
-                table_texts = []
-                for table in tables:
-                    table_md = format_table_md(table["headers"], table["rows"])
-                    table_texts.append(table_md)
-                text = text + "\n\n" + "\n\n".join(table_texts)
-        except Exception:
-            pass
+        # Optional OCR table detection (off by default)
+        if self.extract_tables:
+            try:
+                data = pytesseract.image_to_data(
+                    img, lang=lang, output_type=pytesseract.Output.DICT
+                )
+                tables = self._detect_tables_in_ocr(data)
+                if tables:
+                    table_texts = []
+                    for table in tables:
+                        table_md = format_table_md(table["headers"], table["rows"])
+                        table_texts.append(table_md)
+                    text = text + "\n\n" + "\n\n".join(table_texts)
+            except Exception:
+                pass
 
         return text
 

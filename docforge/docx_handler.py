@@ -20,8 +20,9 @@ from .utils import (
 class DOCXHandler:
     """Convert DOCX files to Markdown and structured JSON."""
 
-    def __init__(self, extract_images: bool = True):
+    def __init__(self, extract_images: bool = True, extract_tables: bool = False):
         self.extract_images = extract_images
+        self.extract_tables = extract_tables
         self._seen_image_hashes: set = set()
 
     def convert(
@@ -69,7 +70,8 @@ class DOCXHandler:
                         sections.append(sec)
 
             elif tag == "tbl":
-                # Table
+                if not self.extract_tables:
+                    continue
                 table = None
                 for t in doc.tables:
                     if t._element is element:

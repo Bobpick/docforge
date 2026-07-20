@@ -115,21 +115,24 @@ class DocForge:
         # Legacy params kept for backward compatibility
         remove_artifacts: bool = True,
         extract_images: bool = True,
+        extract_tables: bool = False,
     ):
         """
         Args:
-            use_llm: Enable LLM-based enhancement for tables & formatting.
+            use_llm: Enable LLM-based enhancement for formatting cleanup.
             llm_provider: LLM provider — "ollama" (default), "gemini", or "openai-compat".
             llm_model: Model name. Defaults: "cogito:14b" (ollama), "gemini-2.0-flash" (gemini).
             llm_api_key: API key (Gemini only). Falls back to GOOGLE_API_KEY env var.
             llm_host: Ollama host URL (default: http://localhost:11434).
             remove_artifacts: Remove headers, footers, page numbers.
             extract_images: Extract and save embedded images.
+            extract_tables: Extract tables (default False — multi-col PDFs shredded badly).
         """
         self.use_llm = use_llm
         self.llm_provider = llm_provider
         self.remove_artifacts = remove_artifacts
         self.extract_images = extract_images
+        self.extract_tables = extract_tables
 
         self.artifact_remover = ArtifactRemover() if remove_artifacts else None
         self.llm_enhancer: Optional[LLMEnhancer] = None
@@ -175,7 +178,16 @@ class DocForge:
             )
 
         start = time.time()
-        handler = handler_class(extract_images=self.extract_images)
+        try:
+            handler = handler_class(
+                extract_images=self.extract_images,
+                extract_tables=self.extract_tables,
+            )
+        except TypeError:
+            # Older handlers without extract_tables kwarg
+            handler = handler_class(extract_images=self.extract_images)
+            if hasattr(handler, "extract_tables"):
+                handler.extract_tables = self.extract_tables
         markdown, structured, images, metadata = handler.convert(path)
 
         # --- Artifact removal ---

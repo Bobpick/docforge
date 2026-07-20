@@ -173,10 +173,22 @@ def filter_tables(
     return kept
 
 
-def strip_garbage_markdown_tables(markdown: str) -> str:
-    """Remove markdown table blocks that fail quality checks."""
+# Product default: tables from PDF multi-col layouts were mostly garbage.
+# Keep helpers above for optional re-enable; strip everything by default.
+DROP_ALL_TABLES = True
+
+
+def strip_garbage_markdown_tables(markdown: str, *, drop_all: Optional[bool] = None) -> str:
+    """Remove markdown table blocks.
+
+    By default drops *all* tables (DROP_ALL_TABLES). Pass drop_all=False to
+    only remove tables that fail quality checks.
+    """
     if not markdown or "|" not in markdown:
         return markdown
+
+    if drop_all is None:
+        drop_all = DROP_ALL_TABLES
 
     lines = markdown.split("\n")
     out: List[str] = []
@@ -193,8 +205,7 @@ def strip_garbage_markdown_tables(markdown: str) -> str:
         while i < len(lines) and lines[i].strip().startswith("|"):
             block.append(lines[i])
             i += 1
-        if _md_table_is_garbage(block):
-            # drop block (and following blank if any — handled by clean_whitespace later)
+        if drop_all or _md_table_is_garbage(block):
             continue
         out.extend(block)
 
@@ -338,6 +349,8 @@ def clean_section_content(section: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Filter/clean a structured section; return None to drop."""
     sec_type = section.get("type")
     if sec_type == "table":
+        if DROP_ALL_TABLES:
+            return None
         headers = section.get("headers") or []
         rows = section.get("rows") or []
         if is_garbage_table(headers, rows):

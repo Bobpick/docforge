@@ -40,9 +40,16 @@ class PDFHandler:
     # Kept for backward compatibility with older call sites / tests
     LIGATURE_FIXES = LIGATURE_CHARS
 
-    def __init__(self, extract_images: bool = True, dpi: int = 150):
+    def __init__(
+        self,
+        extract_images: bool = True,
+        dpi: int = 150,
+        extract_tables: bool = False,
+    ):
         self.extract_images = extract_images
         self.dpi = dpi
+        # Default off: pdfplumber multi-col shreds dominate quality issues
+        self.extract_tables = extract_tables
         self._seen_image_hashes: set = set()
 
     def convert(
@@ -64,14 +71,17 @@ class PDFHandler:
         doc = fitz.open(str(file_path))
         metadata = self._extract_metadata(doc)
 
-        # ---- Phase 1: Multi-strategy table extraction ----
-        table_map = self._extract_tables(file_path, doc)
+        # ---- Phase 1: Tables disabled by default (garbage-first policy) ----
+        # Multi-col academic PDFs produce letter-soup tables; we keep prose only.
+        # Re-enable via DocForge(extract_tables=True) / PDFHandler(extract_tables=True).
+        table_map: Dict[int, List[Dict]] = {}
+        if getattr(self, "extract_tables", False):
+            table_map = self._extract_tables(file_path, doc)
 
         # ---- Phase 2: Page-by-page extraction ----
         all_sections: List[Dict[str, Any]] = []
         all_images: List[Dict[str, Any]] = []
         md_parts: List[str] = []
-        collected_tables: List[Dict[str, Any]] = []
 
         for page_num in range(len(doc)):
             page = doc[page_num]
@@ -80,8 +90,7 @@ class PDFHandler:
                 page_images = self._extract_images(doc, page, page_num + 1)
                 all_images.extend(page_images)
 
-            page_tables = table_map.get(page_num, [])
-            collected_tables.extend(page_tables)
+            page_tables = table_map.get(page_num, []) if table_map else []
             page_md, page_sections = self._extract_text_structured(
                 page, page_num + 1, page_tables
             )
