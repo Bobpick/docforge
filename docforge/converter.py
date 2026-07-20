@@ -195,18 +195,21 @@ class DocForge:
             markdown = self.artifact_remover.remove(markdown, structured)
             structured = self.artifact_remover.remove_from_structured(structured)
 
-        # --- Garbage cleanup (shredded tables, bold spans, hard wraps) ---
+        # --- Garbage cleanup (bold/wraps; tables only if extract_tables=False) ---
         try:
             from .garbage_filter import (
                 clean_extracted_markdown,
                 clean_section_content,
             )
 
-            markdown = clean_extracted_markdown(markdown)
+            drop_all = not getattr(self, "extract_tables", False)
+            markdown = clean_extracted_markdown(
+                markdown, drop_all_tables=drop_all
+            )
             if isinstance(structured, dict) and "sections" in structured:
                 kept = []
                 for s in structured.get("sections") or []:
-                    s2 = clean_section_content(s)
+                    s2 = clean_section_content(s, drop_all_tables=drop_all)
                     if s2 is not None:
                         kept.append(s2)
                 structured["sections"] = kept

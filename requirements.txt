@@ -15,3 +15,7 @@ streamlit>=1.29.0
 
 # LLM enhancement (optional — only needed if use_llm=True)
 google-generativeai>=0.5.0
+
+# Optional: high-quality ruled table extraction (DocForge extract_tables=True)
+# Also needs system Ghostscript (`gs`). Install: pip install camelot-py opencv-python-headless
+# camelot-py>=2.0.0

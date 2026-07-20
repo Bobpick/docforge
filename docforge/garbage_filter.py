@@ -334,9 +334,13 @@ def strip_page_chrome_lines(text: str) -> str:
     return "\n".join(out)
 
 
-def clean_extracted_markdown(markdown: str) -> str:
-    """Full post-pass: drop garbage tables, fix bold, reflow, chrome."""
-    md = strip_garbage_markdown_tables(markdown)
+def clean_extracted_markdown(
+    markdown: str,
+    *,
+    drop_all_tables: Optional[bool] = None,
+) -> str:
+    """Full post-pass: drop tables (all or garbage-only), fix bold, reflow, chrome."""
+    md = strip_garbage_markdown_tables(markdown, drop_all=drop_all_tables)
     md = defragment_bold(md)
     md = reflow_hard_wraps(md)
     md = strip_page_chrome_lines(md)
@@ -345,11 +349,18 @@ def clean_extracted_markdown(markdown: str) -> str:
     return md.strip()
 
 
-def clean_section_content(section: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Filter/clean a structured section; return None to drop."""
+def clean_section_content(
+    section: Dict[str, Any],
+    *,
+    drop_all_tables: Optional[bool] = None,
+) -> Optional[Dict[str, Any]]:
+    """Filter/clean a structured section; return None to drop.
+
+    drop_all_tables: override DROP_ALL_TABLES (e.g. False when extract_tables=True).
+    """
     sec_type = section.get("type")
     if sec_type == "table":
-        if DROP_ALL_TABLES:
+        if drop_all_tables if drop_all_tables is not None else DROP_ALL_TABLES:
             return None
         headers = section.get("headers") or []
         rows = section.get("rows") or []

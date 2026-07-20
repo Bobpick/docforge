@@ -71,9 +71,8 @@ class PDFHandler:
         doc = fitz.open(str(file_path))
         metadata = self._extract_metadata(doc)
 
-        # ---- Phase 1: Tables disabled by default (garbage-first policy) ----
-        # Multi-col academic PDFs produce letter-soup tables; we keep prose only.
-        # Re-enable via DocForge(extract_tables=True) / PDFHandler(extract_tables=True).
+        # ---- Phase 1: Tables (off by default; quality pipeline when on) ----
+        # extract_tables=True → docforge.table_extractor (PyMuPDF → Camelot → pdfplumber)
         table_map: Dict[int, List[Dict]] = {}
         if getattr(self, "extract_tables", False):
             table_map = self._extract_tables(file_path, doc)
@@ -99,22 +98,24 @@ class PDFHandler:
 
         doc.close()
 
-        # ---- Phase 3: Post-processing (garbage-first) ----
+        # ---- Phase 3: Post-processing ----
+        # When tables are intentionally extracted, do not DROP_ALL_TABLES.
+        keep_tables = bool(getattr(self, "extract_tables", False))
+        drop_all = not keep_tables
+
         all_sections = [s for s in all_sections if not self._is_noise_section(s)]
         all_sections = self._dedupe_table_sections(all_sections)
 
-        # Drop shredded / empty / letter-soup tables from structured output
         cleaned_sections: List[Dict[str, Any]] = []
         for s in all_sections:
-            s2 = clean_section_content(s)
+            s2 = clean_section_content(s, drop_all_tables=drop_all)
             if s2 is not None:
                 cleaned_sections.append(s2)
         all_sections = cleaned_sections
 
         markdown = clean_whitespace("\n\n".join(md_parts))
         markdown = self._dedupe_markdown_tables(markdown)
-        # Aggressive: strip garbage MD tables, defrag bold, reflow wraps
-        markdown = clean_extracted_markdown(markdown)
+        markdown = clean_extracted_markdown(markdown, drop_all_tables=drop_all)
         markdown = fix_ligatures_and_ocr(markdown)
         markdown = collapse_spaced_text(markdown)
         markdown = clean_whitespace(markdown)
@@ -234,16 +235,44 @@ class PDFHandler:
         }
 
     # ------------------------------------------------------------------
-    # Table extraction — multi-strategy pdfplumber + PyMuPDF fallback
+    # Table extraction — quality pipeline (table_extractor.py)
     # ------------------------------------------------------------------
     def _extract_tables(
         self, file_path: Path, doc
     ) -> Dict[int, List[Dict]]:
-        """Extract tables with multiple strategies; keep best-scoring grids."""
-        table_map: Dict[int, List[Dict]] = {}
-        num_pages = len(doc)
+        """Extract tables via multi-strategy quality pipeline.
 
-        # --- pdfplumber multi-strategy ---
+        Primary path: ``docforge.table_extractor.extract_tables_from_pdf``
+        (PyMuPDF → Camelot lattice → pdfplumber) with fill-ratio scoring and
+        garbled-header rejection. Falls back to older local extractors if the
+        module is unavailable.
+        """
+        table_map: Dict[int, List[Dict]] = {}
+
+        try:
+            from .table_extractor import extract_tables_from_pdf
+
+            for t in extract_tables_from_pdf(str(file_path)):
+                page = int(t.get("page", 0))
+                headers = list(t.get("headers") or [])
+                rows = [list(r) for r in (t.get("rows") or [])]
+                if not headers and not rows:
+                    continue
+                entry = {
+                    "headers": headers,
+                    "rows": rows,
+                    "bbox": t.get("bbox"),
+                    "score": t.get("score"),
+                    "source": t.get("source"),
+                }
+                table_map.setdefault(page, []).append(entry)
+            return table_map
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning("table_extractor failed, using legacy path: %s", e)
+
+        # --- Legacy fallback: pdfplumber + PyMuPDF ---
+        num_pages = len(doc)
         try:
             import pdfplumber
 
@@ -254,18 +283,15 @@ class PDFHandler:
                     page_tables = self._extract_page_tables_pdfplumber(page)
                     if page_tables:
                         table_map[i] = page_tables
-        except ImportError:
-            pass
         except Exception:
             pass
 
-        # --- PyMuPDF find_tables fallback / fill gaps ---
         try:
             for i in range(num_pages):
                 if i in table_map and any(
                     score_table(t["headers"], t["rows"]) >= 8 for t in table_map[i]
                 ):
-                    continue  # already have a decent table
+                    continue
                 page = doc[i]
                 if not hasattr(page, "find_tables"):
                     break
@@ -291,24 +317,14 @@ class PDFHandler:
                 if is_garbage_table(headers, rows):
                     continue
                 entry = {"headers": headers, "rows": rows, "bbox": None}
-                if i in table_map:
-                    existing_best = max(
-                        (score_table(t["headers"], t["rows"]) for t in table_map[i]),
-                        default=-1,
-                    )
-                    if score_table(headers, rows) > existing_best:
-                        table_map[i] = [entry]
-                else:
-                    table_map[i] = [entry]
+                table_map.setdefault(i, []).append(entry)
         except Exception:
             pass
 
-        # Final garbage sweep per page
         for i in list(table_map.keys()):
             table_map[i] = filter_tables(table_map[i])
             if not table_map[i]:
                 del table_map[i]
-
         return table_map
 
     def _extract_page_tables_pdfplumber(self, page) -> List[Dict]:
@@ -530,16 +546,23 @@ class PDFHandler:
                 md_lines.append(stripped)
                 sections.append({"type": "paragraph", "content": stripped})
 
-        # Append only high-quality tables (garbage already filtered upstream;
-        # re-check in case of reconstruct edge cases)
-        for table in filter_tables(tables):
+        # Append tables already vetted by table_extractor (or legacy filter)
+        for table in tables:
             headers = [h or "" for h in table["headers"]]
             rows = [[c or "" for c in r] for r in table["rows"]]
-            if is_garbage_table(headers, rows):
+            # Soft gate only for legacy path without source/score
+            if not table.get("source") and is_garbage_table(headers, rows):
                 continue
             table_md = format_table_md(headers, rows)
+            if not table_md.strip():
+                continue
             md_lines.append(table_md)
-            sections.append(format_table_json(headers, rows))
+            sec = format_table_json(headers, rows)
+            if table.get("source"):
+                sec["source"] = table["source"]
+            if table.get("score") is not None:
+                sec["score"] = table["score"]
+            sections.append(sec)
 
         return "\n\n".join(md_lines), sections
 
