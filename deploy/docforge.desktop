@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=DocForge
+Comment=Convert PDF/DOCX/PPTX to Markdown & JSON
+Exec=/home/bob/projects/forks/docforge/scripts/launch_docforge.sh
+Icon=/home/bob/projects/forks/docforge/assets/docforge.png
+Path=/home/bob/projects/forks/docforge
+Terminal=false
+Categories=Office;Utility;
+Keywords=pdf;markdown;docforge;convert;
+StartupNotify=true

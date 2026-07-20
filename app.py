@@ -184,6 +184,35 @@ def _convert_one_file(
 with st.sidebar:
     st.markdown("# ⚙️ Settings")
 
+    st.markdown("### PDF tables")
+    table_mode = st.radio(
+        "How to handle tables",
+        options=["off", "quality", "vision"],
+        index=0,
+        format_func=lambda k: {
+            "off": "⚪ Off — prose only (fast, recommended)",
+            "quality": "📐 Quality — PyMuPDF + Camelot geometry",
+            "vision": "👁 Vision — render crops + vision LLM (experimental)",
+        }[k],
+        help=(
+            "Off is best for RAG speed. Quality uses the research table_extractor. "
+            "Vision will crop table regions and ask a vision model (needs a VL model)."
+        ),
+    )
+    extract_tables = table_mode in ("quality", "vision")
+    table_vision = table_mode == "vision"
+    if table_mode == "off":
+        st.caption("No markdown tables — headings and paragraphs only.")
+    elif table_mode == "quality":
+        st.caption("Ruled/spec tables kept; chart noise filtered. Slower than Off.")
+    else:
+        st.info(
+            "Vision mode: geometry finds boxes, then a vision model reads the crop. "
+            "Requires a vision-capable Ollama model (e.g. qwen2-vl). "
+            "Falls back to Quality geometry if vision is unavailable."
+        )
+
+    st.markdown("### Output")
     remove_artifacts = st.checkbox(
         "Remove headers / footers / page numbers",
         value=True,
@@ -199,32 +228,52 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("### 🤖 LLM Enhancement")
 
-    use_llm = st.checkbox(
-        "Enable LLM cleanup",
-        value=False,
-        help="Use an LLM to clean up tables, fix OCR errors, and improve formatting.",
-    )
-
-    llm_provider = st.selectbox(
-        "LLM Provider",
-        ["ollama", "gemini", "openai-compat"],
+    use_llm = st.radio(
+        "LLM cleanup after convert",
+        options=[False, True],
         index=0,
-        help="Ollama runs locally (free, private). Gemini is cloud-based. "
-             "OpenAI-compat works with LM Studio, vLLM, etc.",
+        format_func=lambda v: "Off" if not v else "On — fix OCR / polish markdown",
+        help="Optional second pass with Ollama/Gemini. Separate from table Vision mode.",
     )
 
-    # Provider-specific settings
-    if llm_provider == "ollama":
+    need_llm_ui = bool(use_llm or table_vision)
+    llm_model = os.environ.get("DOCFORGE_OLLAMA_MODEL", "cogito:14b")
+    llm_host = os.environ.get("DOCFORGE_OLLAMA_CLIENT", "http://127.0.0.1:11434")
+    llm_api_key = None
+
+    if not need_llm_ui:
+        st.caption("Turn on **LLM cleanup** or **Vision tables** to configure a model.")
+        llm_provider = "ollama"
+    else:
+        llm_provider = st.radio(
+            "LLM Provider",
+            options=["ollama", "gemini", "openai-compat"],
+            index=0,
+            format_func=lambda k: {
+                "ollama": "🦙 Ollama (local, free)",
+                "gemini": "✨ Gemini (cloud)",
+                "openai-compat": "🔌 OpenAI-compatible",
+            }[k],
+            help="Ollama runs locally. Gemini needs an API key.",
+        )
+
+    # Provider-specific settings (only when LLM / vision is in play)
+    if need_llm_ui and llm_provider == "ollama":
         st.markdown(
             '<span class="provider-badge badge-ollama">🦙 Ollama — Local & Free</span>',
             unsafe_allow_html=True,
         )
+        default_model = os.environ.get("DOCFORGE_OLLAMA_MODEL", "cogito:14b")
+        if table_vision:
+            default_model = os.environ.get(
+                "DOCFORGE_VISION_MODEL",
+                os.environ.get("DOCFORGE_OLLAMA_MODEL", "qwen2-vl:7b"),
+            )
         llm_model = st.text_input(
             "Model",
-            value=os.environ.get("DOCFORGE_OLLAMA_MODEL", "cogito:14b"),
-            help="Ollama model name. Pull with: ollama pull cogito:14b",
+            value=default_model,
+            help="Text model for cleanup, or a vision model (e.g. qwen2-vl) for Vision tables.",
         )
-        # Client URL (API). Server always binds 0.0.0.0:11434 via OllamaServiceManager.
         default_client = os.environ.get(
             "DOCFORGE_OLLAMA_CLIENT",
             "http://127.0.0.1:11434",
@@ -232,73 +281,38 @@ with st.sidebar:
         llm_host = st.text_input(
             "Ollama API URL",
             value=default_client,
-            help="Where DocForge connects. Server is started on 0.0.0.0:11434.",
+            help="Where DocForge connects. Server can bind 0.0.0.0:11434.",
         )
         llm_api_key = None
 
         ollama_mgr = OllamaServiceManager(host=llm_host or "http://127.0.0.1:11434")
 
-        # ── Bootstrap once per browser session: kill + start on 0.0.0.0:11434 ──
+        # Bootstrap only when user actually needs the LLM stack
         if "ollama_bootstrapped" not in st.session_state:
             with st.spinner(
-                "Resetting Ollama — stop existing instance, start on 0.0.0.0:11434…"
+                "Starting Ollama on 0.0.0.0:11434…"
             ):
                 boot = ollama_mgr.ensure_fresh(model=None)
             st.session_state.ollama_bootstrapped = True
             st.session_state.ollama_last_msg = boot.get("message", "")
             st.session_state.ollama_last_ok = bool(boot.get("success"))
 
-        # Show last control message (survives rerun)
         if st.session_state.get("ollama_last_msg"):
             if st.session_state.get("ollama_last_ok", True):
                 st.success(st.session_state.ollama_last_msg)
             else:
                 st.error(st.session_state.ollama_last_msg)
 
-        # Live status
         ollama_status = ollama_mgr.status()
         if ollama_status["running"]:
-            listen = ollama_status.get("listen_all")
-            bind_txt = (
-                "0.0.0.0:11434"
-                if listen
-                else ("127.0.0.1 only" if listen is False else "unknown bind")
-            )
             st.success(
-                f"✅ Ollama running · PID {ollama_status.get('pid', '?')} · {bind_txt}"
+                f"✅ Ollama running · PID {ollama_status.get('pid', '?')}"
             )
-            if ollama_status.get("models"):
-                with st.expander(f"Available models ({len(ollama_status['models'])})"):
-                    for m in ollama_status["models"]:
-                        st.text(m)
         else:
             st.warning("⚠️ Ollama not detected")
 
-        # ── Ollama Service Management ──
         st.markdown("#### 🔧 Ollama Service")
-        st.caption(
-            f"Serve bind: `{ollama_mgr.bind}` · API: `{ollama_mgr.host}` "
-            "· App startup always stops then restarts Ollama."
-        )
-
-        with st.expander("📋 Ollama Status", expanded=True):
-            if ollama_status["running"]:
-                st.write(f"**PID:** `{ollama_status.get('pid', '?')}`")
-                st.write(f"**Bind:** `{ollama_mgr.bind}` (listen_all={ollama_status.get('listen_all')})")
-                st.write(f"**systemd unit active:** `{ollama_status.get('via_systemd')}`")
-                if ollama_status.get("models"):
-                    st.write(
-                        "**Models:** "
-                        + ", ".join(f"`{m}`" for m in ollama_status["models"])
-                    )
-                if ollama_status.get("gpu"):
-                    st.info(
-                        f"🎮 GPU active  ·  {ollama_status.get('memory_mb', 0):.0f} MiB VRAM"
-                    )
-                else:
-                    st.caption("CPU mode (no GPU compute app detected)")
-            else:
-                st.error("🔴 Not running")
+        st.caption(f"API `{ollama_mgr.host}` · bind `{ollama_mgr.bind}`")
 
         def _run_ollama_action(action: str):
             with st.spinner(f"{action.title()} Ollama…"):
@@ -323,7 +337,7 @@ with st.sidebar:
             if st.button("🔄 Restart", key="ollama_restart", use_container_width=True):
                 _run_ollama_action("restart")
 
-    elif llm_provider == "gemini":
+    elif need_llm_ui and llm_provider == "gemini":
         st.markdown(
             '<span class="provider-badge badge-gemini">✨ Gemini — Cloud</span>',
             unsafe_allow_html=True,
@@ -341,7 +355,7 @@ with st.sidebar:
         )
         llm_host = None
 
-    else:  # openai-compat
+    elif need_llm_ui and llm_provider == "openai-compat":
         st.markdown(
             '<span class="provider-badge badge-openai">🔌 OpenAI-Compatible</span>',
             unsafe_allow_html=True,
@@ -428,6 +442,9 @@ if uploaded_files:
         # Clear previous results
         st.session_state.batch_results = {}
 
+        # Stash vision flag for future crop→VL path; geometry used for quality/vision today
+        os.environ["DOCFORGE_TABLE_VISION"] = "1" if table_vision else "0"
+
         forge = DocForge(
             use_llm=use_llm,
             llm_provider=llm_provider,
@@ -436,6 +453,7 @@ if uploaded_files:
             llm_host=llm_host,
             remove_artifacts=remove_artifacts,
             extract_images=extract_images,
+            extract_tables=extract_tables,
         )
 
         total = len(uploaded_files)
