@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""DocForge Web App — Interactive document conversion powered by Streamlit.
+"""DocForge Web App — Batch document conversion powered by Streamlit.
 
 Run with:
     streamlit run app.py
@@ -10,13 +10,17 @@ import sys
 import json
 import time
 import tempfile
+import zipfile
+import io
 from pathlib import Path
+from typing import Optional, Dict, Any
 
 # Ensure the docforge package is importable
 sys.path.insert(0, str(Path(__file__).parent))
 
 import streamlit as st
-from docforge.converter import DocForge
+from docforge.converter import DocForge, ConversionResult
+from docforge.llm_enhancer import LLMEnhancer
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -29,7 +33,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Custom CSS for a polished look
+# Custom CSS
 st.markdown("""
 <style>
     .main-header { font-size: 2.5rem; font-weight: 700; margin-bottom: 0; }
@@ -48,8 +52,130 @@ st.markdown("""
     .stat-label  { font-size: 0.8rem; color: #8b949e; }
     .image-grid  { display: flex; flex-wrap: wrap; gap: 12px; }
     .image-grid img { max-height: 200px; border-radius: 6px; border: 1px solid #30363d; }
+    .provider-badge {
+        display: inline-block; padding: 2px 10px; border-radius: 12px;
+        font-size: 0.8rem; font-weight: 600;
+    }
+    .badge-ollama { background: #1a3a2a; color: #4ade80; }
+    .badge-gemini { background: #1a2a3a; color: #60a5fa; }
+    .badge-openai { background: #2a1a3a; color: #c084fc; }
+    .file-chip {
+        display: inline-flex; align-items: center; gap: 6px;
+        background: #161b22; border: 1px solid #30363d; border-radius: 16px;
+        padding: 4px 12px; font-size: 0.85rem; margin: 3px;
+    }
+    .file-chip .name { color: #e6edf3; }
+    .file-chip .size { color: #8b949e; font-size: 0.75rem; }
+    .file-chip .remove { color: #f85149; cursor: pointer; font-weight: bold; }
+    .batch-progress {
+        background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+        padding: 0.75rem 1rem; margin: 0.5rem 0;
+    }
 </style>
 """, unsafe_allow_html=True)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Session state initialization
+# ──────────────────────────────────────────────────────────────────────
+if "batch_results" not in st.session_state:
+    st.session_state.batch_results: Dict[str, Dict[str, Any]] = {}
+if "file_queue" not in st.session_state:
+    st.session_state.file_queue: list = []  # list of (name, size, type) tuples
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Helper functions
+# ──────────────────────────────────────────────────────────────────────
+def _escape_html(text: str) -> str:
+    """Escape HTML special chars for display in a div."""
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def _file_size_str(size_bytes: int) -> str:
+    """Human-readable file size."""
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    elif size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.1f} KB"
+    else:
+        return f"{size_bytes / (1024 * 1024):.1f} MB"
+
+
+def _build_zip(results: Dict[str, Dict[str, Any]]) -> bytes:
+    """Build a ZIP archive containing all conversion results.
+
+    Each file gets its own subfolder named after the source stem.
+    """
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for filename, res in results.items():
+            stem = Path(filename).stem
+            if res.get("error"):
+                zf.writestr(f"{stem}/ERROR.txt", res["error"])
+                continue
+            # Markdown
+            if res.get("markdown"):
+                zf.writestr(f"{stem}/{stem}.md", res["markdown"])
+            # JSON
+            if res.get("structured"):
+                zf.writestr(
+                    f"{stem}/{stem}.json",
+                    json.dumps(res["structured"], indent=2, ensure_ascii=False, default=str),
+                )
+            # Images
+            if res.get("image_data"):
+                for img_name, img_bytes in res["image_data"].items():
+                    zf.writestr(f"{stem}/images/{img_name}", img_bytes)
+    return buf.getvalue()
+
+
+def _convert_one_file(
+    uploaded_file,
+    forge: DocForge,
+    output_dir: str,
+) -> Dict[str, Any]:
+    """Convert a single uploaded file. Returns a dict with results or error."""
+    suffix = Path(uploaded_file.name).suffix
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(uploaded_file.getbuffer())
+        tmp_path = tmp.name
+
+    try:
+        start = time.time()
+        result = forge.convert(tmp_path, output_dir=output_dir)
+        elapsed = time.time() - start
+
+        # Collect image bytes for ZIP download
+        image_data = {}
+        if result.images:
+            images_dir = Path(output_dir) / "images"
+            for img in result.images:
+                img_path = images_dir / img["filename"]
+                if img_path.exists():
+                    image_data[img["filename"]] = img_path.read_bytes()
+
+        return {
+            "markdown": result.markdown,
+            "structured": result.structured,
+            "images": result.images,
+            "image_data": image_data,
+            "metadata": result.metadata,
+            "elapsed": elapsed,
+            "output_dir": output_dir,
+            "error": None,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -71,32 +197,91 @@ with st.sidebar:
     )
 
     st.markdown("---")
-    st.markdown("### 🤖 LLM Enhancement (Gemini)")
+    st.markdown("### 🤖 LLM Enhancement")
 
     use_llm = st.checkbox(
         "Enable LLM cleanup",
         value=False,
-        help="Use Google Gemini to clean up tables, fix OCR errors, and improve formatting.",
+        help="Use an LLM to clean up tables, fix OCR errors, and improve formatting.",
     )
 
-    llm_api_key = st.text_input(
-        "Google AI API Key",
-        type="password",
-        value=os.environ.get("GOOGLE_API_KEY", ""),
-        help="Your Google AI API key for Gemini. Also set via GOOGLE_API_KEY env var.",
-    )
-
-    llm_model = st.selectbox(
-        "Gemini Model",
-        ["gemini-2.0-flash", "gemini-2.5-flash", "gemini-2.5-pro"],
+    llm_provider = st.selectbox(
+        "LLM Provider",
+        ["ollama", "gemini", "openai-compat"],
         index=0,
-        help="Select which Gemini model to use for enhancement.",
+        help="Ollama runs locally (free, private). Gemini is cloud-based. "
+             "OpenAI-compat works with LM Studio, vLLM, etc.",
     )
+
+    # Provider-specific settings
+    if llm_provider == "ollama":
+        st.markdown(
+            '<span class="provider-badge badge-ollama">🦙 Ollama — Local & Free</span>',
+            unsafe_allow_html=True,
+        )
+        llm_model = st.text_input(
+            "Model",
+            value=os.environ.get("DOCFORGE_OLLAMA_MODEL", "cogito:14b"),
+            help="Ollama model name. Pull with: ollama pull cogito:14b",
+        )
+        llm_host = st.text_input(
+            "Ollama Host",
+            value=os.environ.get("OLLAMA_HOST", "http://localhost:11434"),
+            help="Ollama server URL.",
+        )
+        llm_api_key = None
+
+        # Show available models if Ollama is running
+        try:
+            enhancer_check = LLMEnhancer(provider="ollama", model=llm_model, host=llm_host)
+            info = enhancer_check.get_provider_info()
+            if info["available"]:
+                st.success("✅ Ollama is running")
+                if info.get("models"):
+                    with st.expander(f"Available models ({len(info['models'])})"):
+                        for m in info["models"]:
+                            st.text(m)
+            else:
+                st.warning("⚠️ Ollama not detected — make sure it's running")
+        except Exception:
+            st.warning("⚠️ Could not check Ollama status")
+
+    elif llm_provider == "gemini":
+        st.markdown(
+            '<span class="provider-badge badge-gemini">✨ Gemini — Cloud</span>',
+            unsafe_allow_html=True,
+        )
+        llm_model = st.text_input(
+            "Model",
+            value="gemini-2.0-flash",
+            help="Gemini model name.",
+        )
+        llm_api_key = st.text_input(
+            "Google AI API Key",
+            type="password",
+            value=os.environ.get("GOOGLE_API_KEY", ""),
+            help="Your Google AI API key. Also set via GOOGLE_API_KEY env var.",
+        )
+        llm_host = None
+
+    else:  # openai-compat
+        st.markdown(
+            '<span class="provider-badge badge-openai">🔌 OpenAI-Compatible</span>',
+            unsafe_allow_html=True,
+        )
+        llm_model = st.text_input("Model", value="local-model")
+        llm_api_key = st.text_input("API Key", value="not-needed", type="password")
+        llm_host = st.text_input(
+            "API Base URL",
+            value="http://localhost:8080/v1",
+            help="Base URL for OpenAI-compatible API.",
+        )
 
     st.markdown("---")
     st.markdown(
         "<div style='font-size:0.75rem; color:#666;'>"
-        "DocForge v1.0 — PDF · DOCX · PPTX · Images → Markdown & JSON"
+        "DocForge v1.0 — PDF · DOCX · PPTX · Images → Markdown & JSON<br>"
+        "Batch drag & drop supported 📂"
         "</div>",
         unsafe_allow_html=True,
     )
@@ -108,157 +293,335 @@ with st.sidebar:
 st.markdown('<p class="main-header">📄 DocForge</p>', unsafe_allow_html=True)
 st.markdown(
     '<p class="sub-header">Convert documents to clean Markdown & JSON — '
-    'with table, math, and code support.</p>',
+    'drag & drop multiple files for batch processing.</p>',
     unsafe_allow_html=True,
 )
 
-uploaded_file = st.file_uploader(
-    "Upload a document",
+# ──────────────────────────────────────────────────────────────────────
+# File uploader — batch support
+# ──────────────────────────────────────────────────────────────────────
+uploaded_files = st.file_uploader(
+    "📂 Upload documents (drag & drop multiple files)",
     type=["pdf", "docx", "doc", "pptx", "ppt", "png", "jpg", "jpeg", "tiff", "tif", "bmp", "webp", "gif"],
-    help="Drag and drop or click to browse. Supports PDF, Word, PowerPoint, and image files.",
+    accept_multiple_files=True,
+    help="Drag and drop one or more files, or click to browse. "
+         "Supports PDF, DOCX, PPTX, and images.",
 )
 
-if uploaded_file is not None:
-    # Show file info
-    file_details = {
-        "Filename": uploaded_file.name,
-        "Size": f"{uploaded_file.size / 1024:.1f} KB",
-        "Type": uploaded_file.type or "unknown",
-    }
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.info(f"📄 **{file_details['Filename']}**")
-    with col2:
-        st.info(f"💾 **{file_details['Size']}**")
-    with col3:
-        st.info(f"🏷️ **{file_details['Type']}**")
+# ── File queue display ──
+if uploaded_files:
+    st.markdown(f"### 📋 File Queue ({len(uploaded_files)} file{'s' if len(uploaded_files) != 1 else ''})")
 
-    # Convert button
-    if st.button("🔄 Convert", type="primary", use_container_width=True):
-        # Write uploaded file to a temp location
-        suffix = Path(uploaded_file.name).suffix
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(uploaded_file.getbuffer())
-            tmp_path = tmp.name
-
-        output_dir = tempfile.mkdtemp()
-
-        try:
-            # Build the converter with current settings
-            forge = DocForge(
-                use_llm=use_llm,
-                llm_api_key=llm_api_key if llm_api_key else None,
-                llm_model=llm_model,
-                remove_artifacts=remove_artifacts,
-                extract_images=extract_images,
+    # Show files in a clean grid
+    file_cols = st.columns(min(len(uploaded_files), 5))
+    for i, uf in enumerate(uploaded_files):
+        col = file_cols[i % len(file_cols)]
+        with col:
+            ext = Path(uf.name).suffix.lower().replace(".", "")
+            icon = {"pdf": "📕", "docx": "📘", "doc": "📘", "pptx": "📙", "ppt": "📙"}.get(ext, "🖼️")
+            st.markdown(
+                f'<div class="file-chip">'
+                f'<span class="name">{icon} {uf.name}</span>'
+                f'<span class="size">{_file_size_str(uf.size)}</span>'
+                f'</div>',
+                unsafe_allow_html=True,
             )
 
-            with st.spinner("Converting document…"):
-                start = time.time()
-                result = forge.convert(tmp_path, output_dir=output_dir)
-                elapsed = time.time() - start
+    # ── Batch convert button ──
+    st.markdown("---")
 
-            st.success(f"✅ Conversion complete in {elapsed:.1f}s")
+    col_convert, col_clear = st.columns([3, 1])
+    with col_convert:
+        convert_btn = st.button(
+            f"🔄 Convert {len(uploaded_files)} File{'s' if len(uploaded_files) != 1 else ''}",
+            type="primary",
+            use_container_width=True,
+        )
+    with col_clear:
+        clear_btn = st.button(
+            "🗑️ Clear Results",
+            use_container_width=True,
+        )
 
-            # ── Stats ──
-            stats = result.structured.get("stats", {})
-            stat_cols = st.columns(len(stats) if stats else 1)
-            for i, (label, value) in enumerate(stats.items()):
-                with stat_cols[i % len(stat_cols)]:
-                    st.markdown(
-                        f'<div class="stat-card">'
-                        f'<div class="stat-number">{value}</div>'
-                        f'<div class="stat-label">{label.replace("_", " ").title()}</div>'
-                        f'</div>',
-                        unsafe_allow_html=True,
-                    )
+    if clear_btn:
+        st.session_state.batch_results = {}
+        st.rerun()
 
-            # ── Output tabs ──
+    if convert_btn:
+        # Clear previous results
+        st.session_state.batch_results = {}
+
+        forge = DocForge(
+            use_llm=use_llm,
+            llm_provider=llm_provider,
+            llm_model=llm_model,
+            llm_api_key=llm_api_key,
+            llm_host=llm_host,
+            remove_artifacts=remove_artifacts,
+            extract_images=extract_images,
+        )
+
+        total = len(uploaded_files)
+        success_count = 0
+        error_count = 0
+
+        # Progress bar + status
+        progress_bar = st.progress(0, text=f"Converting 0/{total} files…")
+        status_area = st.empty()
+
+        for idx, uf in enumerate(uploaded_files):
+            status_area.info(f"📄 Converting **{uf.name}** ({idx + 1}/{total})…")
+
+            output_dir = tempfile.mkdtemp(prefix=f"docforge_{Path(uf.name).stem}_")
+            result = _convert_one_file(uf, forge, output_dir)
+            st.session_state.batch_results[uf.name] = result
+
+            if result.get("error"):
+                error_count += 1
+            else:
+                success_count += 1
+
+            progress_bar.progress(
+                (idx + 1) / total,
+                text=f"Converted {idx + 1}/{total} files — ✅ {success_count} · ❌ {error_count}",
+            )
+
+        # Final status
+        if error_count == 0:
+            status_area.success(
+                f"✅ All {total} file{'s' if total != 1 else ''} converted successfully "
+                f"({success_count} succeeded, {error_count} failed)"
+            )
+        else:
+            status_area.warning(
+                f"⚠️ Conversion complete — {success_count} succeeded, {error_count} failed "
+                f"out of {total} file{'s' if total != 1 else ''}"
+            )
+
+# ──────────────────────────────────────────────────────────────────────
+# Results display
+# ──────────────────────────────────────────────────────────────────────
+if st.session_state.batch_results:
+    results = st.session_state.batch_results
+    total_files = len(results)
+    success_files = {k: v for k, v in results.items() if not v.get("error")}
+    error_files = {k: v for k, v in results.items() if v.get("error")}
+
+    # ── Summary stats ──
+    st.markdown("## 📊 Results")
+
+    stat_cols = st.columns(4)
+    with stat_cols[0]:
+        st.markdown(
+            f'<div class="stat-card"><div class="stat-number">{total_files}</div>'
+            f'<div class="stat-label">Total Files</div></div>',
+            unsafe_allow_html=True,
+        )
+    with stat_cols[1]:
+        st.markdown(
+            f'<div class="stat-card"><div class="stat-number">{len(success_files)}</div>'
+            f'<div class="stat-label">Succeeded</div></div>',
+            unsafe_allow_html=True,
+        )
+    with stat_cols[2]:
+        st.markdown(
+            f'<div class="stat-card"><div class="stat-number">{len(error_files)}</div>'
+            f'<div class="stat-label">Failed</div></div>',
+            unsafe_allow_html=True,
+        )
+    with stat_cols[3]:
+        total_md = sum(len(v.get("markdown", "")) for v in success_files.values())
+        st.markdown(
+            f'<div class="stat-card"><div class="stat-number">{_file_size_str(total_md)}</div>'
+            f'<div class="stat-label">Total Markdown</div></div>',
+            unsafe_allow_html=True,
+        )
+
+    # ── Download All as ZIP ──
+    if success_files:
+        st.markdown("---")
+        zip_bytes = _build_zip(success_files)
+        st.download_button(
+            "📦 Download All as ZIP",
+            data=zip_bytes,
+            file_name="docforge_batch.zip",
+            mime="application/zip",
+            use_container_width=True,
+        )
+
+    # ── Per-file results ──
+    st.markdown("### 📄 File Results")
+
+    for filename, res in results.items():
+        stem = Path(filename).stem
+        ext = Path(filename).suffix.lower().replace(".", "")
+        icon = {"pdf": "📕", "docx": "📘", "doc": "📘", "pptx": "📙", "ppt": "📙"}.get(ext, "🖼️")
+
+        if res.get("error"):
+            with st.expander(f"❌ {icon} {filename}", expanded=False):
+                st.error(f"Conversion failed: {res['error']}")
+            continue
+
+        elapsed = res.get("elapsed", 0)
+        stats = res.get("structured", {}).get("stats", {})
+        n_images = len(res.get("images", []))
+
+        # Build a short summary line
+        stat_parts = [f"⏱ {elapsed:.1f}s"]
+        if stats:
+            for k, v in list(stats.items())[:3]:
+                stat_parts.append(f"{k.replace('_', ' ').title()}: {v}")
+        if n_images:
+            stat_parts.append(f"🖼 {n_images} image{'s' if n_images != 1 else ''}")
+
+        summary = " · ".join(stat_parts)
+
+        with st.expander(f"✅ {icon} {filename}  —  {summary}", expanded=(total_files == 1)):
+            # Per-file stats
+            if stats:
+                stat_cards = st.columns(len(stats) if stats else 1)
+                for i, (label, value) in enumerate(stats.items()):
+                    with stat_cards[i % len(stat_cards)]:
+                        st.markdown(
+                            f'<div class="stat-card">'
+                            f'<div class="stat-number">{value}</div>'
+                            f'<div class="stat-label">{label.replace("_", " ").title()}</div>'
+                            f'</div>',
+                            unsafe_allow_html=True,
+                        )
+
+            # LLM info
+            if use_llm and res.get("structured", {}).get("metadata", {}).get("use_llm"):
+                st.caption("🤖 LLM enhanced")
+
+            # Tabs: Markdown / JSON / Images / Download
             tab_md, tab_json, tab_images, tab_download = st.tabs(
                 ["📝 Markdown", "📊 JSON", "🖼️ Images", "⬇️ Download"]
             )
 
             with tab_md:
-                st.markdown("### Markdown Output")
+                st.markdown("#### Markdown Output")
                 st.markdown(
-                    f'<div class="result-box">{_escape_html(result.markdown)}</div>',
+                    f'<div class="result-box">{_escape_html(res["markdown"])}</div>',
                     unsafe_allow_html=True,
-                    )
-                # Also render the markdown
+                )
                 with st.expander("📖 Rendered Preview"):
-                    st.markdown(result.markdown)
+                    st.markdown(res["markdown"])
 
             with tab_json:
-                st.markdown("### Structured JSON")
-                json_str = json.dumps(result.structured, indent=2, ensure_ascii=False, default=str)
+                st.markdown("#### Structured JSON")
+                json_str = json.dumps(res["structured"], indent=2, ensure_ascii=False, default=str)
                 st.code(json_str, language="json")
 
             with tab_images:
-                st.markdown("### Extracted Images")
-                if result.images:
-                    img_cols = st.columns(min(len(result.images), 4))
-                    for idx, img in enumerate(result.images):
+                st.markdown("#### Extracted Images")
+                if res.get("images"):
+                    img_cols = st.columns(min(len(res["images"]), 4))
+                    for idx, img in enumerate(res["images"]):
                         col = img_cols[idx % len(img_cols)]
                         with col:
-                            img_path = Path(output_dir) / "images" / img["filename"]
-                            if img_path.exists():
-                                st.image(str(img_path), caption=img["filename"])
+                            img_data = res.get("image_data", {}).get(img["filename"])
+                            if img_data:
+                                st.image(img_data, caption=img["filename"])
                             else:
-                                st.text(f"{img['filename']} (not saved)")
+                                st.text(f"{img['filename']} (not available)")
                 else:
                     st.info("No images extracted from this document.")
 
             with tab_download:
-                st.markdown("### Download Files")
-                md_path = Path(output_dir) / "output.md"
-                json_path = Path(output_dir) / "output.json"
+                st.markdown("#### Download Files")
+                md_bytes = res["markdown"].encode("utf-8")
+                json_bytes = json.dumps(
+                    res["structured"], indent=2, ensure_ascii=False, default=str
+                ).encode("utf-8")
 
-                if md_path.exists():
+                dl_col1, dl_col2 = st.columns(2)
+                with dl_col1:
                     st.download_button(
                         "📝 Download Markdown",
-                        data=md_path.read_bytes(),
-                        file_name=f"{Path(uploaded_file.name).stem}.md",
+                        data=md_bytes,
+                        file_name=f"{stem}.md",
                         mime="text/markdown",
+                        key=f"dl_md_{filename}",
                         use_container_width=True,
                     )
-                if json_path.exists():
+                with dl_col2:
                     st.download_button(
                         "📊 Download JSON",
-                        data=json_path.read_bytes(),
-                        file_name=f"{Path(uploaded_file.name).stem}.json",
+                        data=json_bytes,
+                        file_name=f"{stem}.json",
                         mime="application/json",
+                        key=f"dl_json_{filename}",
                         use_container_width=True,
                     )
-                # Individual images
-                if result.images:
-                    images_dir = Path(output_dir) / "images"
-                    for img in result.images:
-                        img_path = images_dir / img["filename"]
-                        if img_path.exists():
-                            st.download_button(
-                                f"🖼️ {img['filename']}",
-                                data=img_path.read_bytes(),
-                                file_name=img["filename"],
-                                mime="image/png",
-                            )
 
-        except Exception as e:
-            st.error(f"❌ Conversion failed: {e}")
-            with st.expander("Show traceback"):
-                st.exception(e)
+                if res.get("image_data"):
+                    st.markdown("**Images:**")
+                    for img_name, img_bytes in res["image_data"].items():
+                        st.download_button(
+                            f"🖼️ {img_name}",
+                            data=img_bytes,
+                            file_name=img_name,
+                            mime="image/png",
+                            key=f"dl_img_{filename}_{img_name}",
+                        )
 
-        finally:
-            # Cleanup temp files
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+    # ── Combined Markdown preview ──
+    if len(success_files) > 1:
+        st.markdown("---")
+        st.markdown("### 📑 Combined Output")
 
+        combined_md = "\n\n---\n\n".join(
+            f"# {Path(f).stem}\n\n{r['markdown']}"
+            for f, r in success_files.items()
+        )
 
-def _escape_html(text: str) -> str:
-    """Escape HTML special chars for display in a div."""
-    return (
-        text.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
+        with st.expander("📖 Combined Markdown Preview", expanded=False):
+            st.markdown(combined_md)
+
+        combined_json = {
+            "batch": True,
+            "files": {
+                Path(f).stem: r["structured"]
+                for f, r in success_files.items()
+            },
+        }
+        combined_json_bytes = json.dumps(
+            combined_json, indent=2, ensure_ascii=False, default=str
+        ).encode("utf-8")
+
+        dl1, dl2 = st.columns(2)
+        with dl1:
+            st.download_button(
+                "📝 Download Combined Markdown",
+                data=combined_md.encode("utf-8"),
+                file_name="docforge_combined.md",
+                mime="text/markdown",
+                use_container_width=True,
+            )
+        with dl2:
+            st.download_button(
+                "📊 Download Combined JSON",
+                data=combined_json_bytes,
+                file_name="docforge_combined.json",
+                mime="application/json",
+                use_container_width=True,
+            )
+
+else:
+    # ── Empty state ──
+    st.markdown(
+        """
+        <div style='text-align: center; padding: 3rem; color: #8b949e;'>
+            <div style='font-size: 3rem; margin-bottom: 1rem;'>📂</div>
+            <div style='font-size: 1.2rem; margin-bottom: 0.5rem;'>
+                Drag & drop multiple files above
+            </div>
+            <div style='font-size: 0.9rem;'>
+                Supports PDF, DOCX, PPTX, and images<br>
+                All files are processed in batch with a single click
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
