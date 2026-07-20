@@ -224,72 +224,104 @@ with st.sidebar:
             value=os.environ.get("DOCFORGE_OLLAMA_MODEL", "cogito:14b"),
             help="Ollama model name. Pull with: ollama pull cogito:14b",
         )
+        # Client URL (API). Server always binds 0.0.0.0:11434 via OllamaServiceManager.
+        default_client = os.environ.get(
+            "DOCFORGE_OLLAMA_CLIENT",
+            "http://127.0.0.1:11434",
+        )
         llm_host = st.text_input(
-            "Ollama Host",
-            value=os.environ.get("OLLAMA_HOST", "http://localhost:11434"),
-            help="Ollama server URL.",
+            "Ollama API URL",
+            value=default_client,
+            help="Where DocForge connects. Server is started on 0.0.0.0:11434.",
         )
         llm_api_key = None
 
-        # Show available models if Ollama is running
-        try:
-            enhancer_check = LLMEnhancer(provider="ollama", model=llm_model, host=llm_host)
-            info = enhancer_check.get_provider_info()
-            if info["available"]:
-                st.success("✅ Ollama is running")
-                if info.get("models"):
-                    with st.expander(f"Available models ({len(info['models'])})"):
-                        for m in info["models"]:
-                            st.text(m)
+        ollama_mgr = OllamaServiceManager(host=llm_host or "http://127.0.0.1:11434")
+
+        # ── Bootstrap once per browser session: kill + start on 0.0.0.0:11434 ──
+        if "ollama_bootstrapped" not in st.session_state:
+            with st.spinner(
+                "Resetting Ollama — stop existing instance, start on 0.0.0.0:11434…"
+            ):
+                boot = ollama_mgr.ensure_fresh(model=None)
+            st.session_state.ollama_bootstrapped = True
+            st.session_state.ollama_last_msg = boot.get("message", "")
+            st.session_state.ollama_last_ok = bool(boot.get("success"))
+
+        # Show last control message (survives rerun)
+        if st.session_state.get("ollama_last_msg"):
+            if st.session_state.get("ollama_last_ok", True):
+                st.success(st.session_state.ollama_last_msg)
             else:
-                st.warning("⚠️ Ollama not detected — make sure it's running")
-        except Exception:
-            st.warning("⚠️ Could not check Ollama status")
+                st.error(st.session_state.ollama_last_msg)
+
+        # Live status
+        ollama_status = ollama_mgr.status()
+        if ollama_status["running"]:
+            listen = ollama_status.get("listen_all")
+            bind_txt = (
+                "0.0.0.0:11434"
+                if listen
+                else ("127.0.0.1 only" if listen is False else "unknown bind")
+            )
+            st.success(
+                f"✅ Ollama running · PID {ollama_status.get('pid', '?')} · {bind_txt}"
+            )
+            if ollama_status.get("models"):
+                with st.expander(f"Available models ({len(ollama_status['models'])})"):
+                    for m in ollama_status["models"]:
+                        st.text(m)
+        else:
+            st.warning("⚠️ Ollama not detected")
 
         # ── Ollama Service Management ──
         st.markdown("#### 🔧 Ollama Service")
-        ollama_mgr = OllamaServiceManager(host=llm_host or "http://localhost:11434")
+        st.caption(
+            f"Serve bind: `{ollama_mgr.bind}` · API: `{ollama_mgr.host}` "
+            "· App startup always stops then restarts Ollama."
+        )
 
-        # Show current status
-        with st.expander("📋 Ollama Status", expanded=False):
-            ollama_status = ollama_mgr.status()
+        with st.expander("📋 Ollama Status", expanded=True):
             if ollama_status["running"]:
-                st.success(f"🟢 Running  ·  PID: {ollama_status.get('pid', '?')}")
+                st.write(f"**PID:** `{ollama_status.get('pid', '?')}`")
+                st.write(f"**Bind:** `{ollama_mgr.bind}` (listen_all={ollama_status.get('listen_all')})")
+                st.write(f"**systemd unit active:** `{ollama_status.get('via_systemd')}`")
                 if ollama_status.get("models"):
-                    st.write("**Models:** " + ", ".join(f"`{m}`" for m in ollama_status["models"]))
+                    st.write(
+                        "**Models:** "
+                        + ", ".join(f"`{m}`" for m in ollama_status["models"])
+                    )
                 if ollama_status.get("gpu"):
-                    st.info(f"🎮 GPU active  ·  {ollama_status.get('memory_mb', 0):.0f} MiB VRAM")
+                    st.info(
+                        f"🎮 GPU active  ·  {ollama_status.get('memory_mb', 0):.0f} MiB VRAM"
+                    )
                 else:
-                    st.caption("CPU mode (no GPU detected)")
+                    st.caption("CPU mode (no GPU compute app detected)")
             else:
                 st.error("🔴 Not running")
 
-        # Control buttons
+        def _run_ollama_action(action: str):
+            with st.spinner(f"{action.title()} Ollama…"):
+                if action == "start":
+                    result = ollama_mgr.start(model=llm_model, force_bind=True)
+                elif action == "stop":
+                    result = ollama_mgr.stop()
+                else:
+                    result = ollama_mgr.restart(model=llm_model)
+            st.session_state.ollama_last_msg = result.get("message", "")
+            st.session_state.ollama_last_ok = bool(result.get("success"))
+            st.rerun()
+
         ollama_col1, ollama_col2, ollama_col3 = st.columns(3)
         with ollama_col1:
             if st.button("▶️ Start", key="ollama_start", use_container_width=True):
-                result = ollama_mgr.start(model=llm_model)
-                if result["success"]:
-                    st.success(result["message"])
-                else:
-                    st.error(result["message"])
-                st.rerun()
+                _run_ollama_action("start")
         with ollama_col2:
             if st.button("⏹️ Stop", key="ollama_stop", use_container_width=True):
-                result = ollama_mgr.stop()
-                if result["success"]:
-                    st.success(result["message"])
-                else:
-                    st.error(result["message"])
-                st.rerun()
+                _run_ollama_action("stop")
         with ollama_col3:
             if st.button("🔄 Restart", key="ollama_restart", use_container_width=True):
-                result = ollama_mgr.restart(model=llm_model)
-                if result["success"]:
-                    st.success(result["message"])
-                else:
-                    st.error(result["message"])
-                st.rerun()
+                _run_ollama_action("restart")
 
     elif llm_provider == "gemini":
         st.markdown(

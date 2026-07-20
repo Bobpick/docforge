@@ -246,78 +246,228 @@ class OpenAICompatibleProvider(LLMProvider):
 # Ollama service management
 # ──────────────────────────────────────────────────────────────────────
 
+# Bind address for `ollama serve` (listen on all interfaces).
+DEFAULT_OLLAMA_BIND = "0.0.0.0:11434"
+# HTTP client URL used for API checks (0.0.0.0 is not a valid connect target).
+DEFAULT_OLLAMA_CLIENT = "http://127.0.0.1:11434"
+
+
+def _normalize_ollama_client_url(host: Optional[str]) -> str:
+    """Normalize client URL. Map 0.0.0.0 → 127.0.0.1 for HTTP requests."""
+    raw = (host or os.environ.get("DOCFORGE_OLLAMA_CLIENT") or DEFAULT_OLLAMA_CLIENT).strip()
+    if not raw.startswith("http"):
+        raw = "http://" + raw
+    raw = raw.rstrip("/")
+    # Connecting to http://0.0.0.0:... is flaky; always hit loopback for client calls
+    raw = raw.replace("://0.0.0.0", "://127.0.0.1")
+    raw = raw.replace("://localhost", "://127.0.0.1")
+    return raw
+
+
 class OllamaServiceManager:
     """Manage the Ollama service lifecycle — start, stop, restart, status.
 
-    This is useful for batch processing where you want to:
-    - Stop Ollama to free GPU/RAM during non-LLM conversion steps
-    - Restart Ollama when LLM enhancement is needed
-    - Recover from stuck/crashed Ollama processes
+    Always (re)starts ``ollama serve`` with ``OLLAMA_HOST=0.0.0.0:11434`` so
+    the API is reachable on all interfaces. Stops systemd-managed instances
+    first (they often bind only 127.0.0.1 and ignore Restart button pkill).
     """
 
-    def __init__(self, host: str = "http://localhost:11434"):
-        self.host = host.rstrip("/")
+    def __init__(
+        self,
+        host: Optional[str] = None,
+        bind: Optional[str] = None,
+    ):
+        self.host = _normalize_ollama_client_url(host)
+        # Bind address for the server process (not the HTTP client URL).
+        env_bind = os.environ.get("OLLAMA_BIND")
+        env_host = os.environ.get("OLLAMA_HOST")
+        # Only treat OLLAMA_HOST as a bind if it's host[:port], not an http URL
+        if not env_bind and env_host and "://" not in env_host:
+            env_bind = env_host
+        self.bind = bind or env_bind or DEFAULT_OLLAMA_BIND
+        if "://" in self.bind:
+            self.bind = self.bind.split("://", 1)[1]
+        if ":" not in self.bind:
+            self.bind = f"{self.bind}:11434"
+
+    # ── internals ────────────────────────────────────────────────────
+
+    def _api_ok(self, timeout: float = 3.0) -> bool:
+        try:
+            req = urllib.request.Request(f"{self.host}/api/tags")
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.status == 200
+        except Exception:
+            return False
+
+    def _list_models(self) -> list:
+        try:
+            req = urllib.request.Request(f"{self.host}/api/tags")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                return [m["name"] for m in data.get("models", [])]
+        except Exception:
+            return []
+
+    def _find_ollama_binary_pids(self) -> list:
+        """PIDs whose executable is the ollama binary (never our CLI/python)."""
+        pids = []
+        try:
+            # -x: process name is exactly "ollama" (not "python ... ollama restart")
+            result = subprocess.run(
+                ["pgrep", "-x", "ollama"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0:
+                for line in result.stdout.strip().splitlines():
+                    if line.strip().isdigit():
+                        pids.append(int(line.strip()))
+        except Exception:
+            pass
+        return pids
+
+    def _find_serve_pids(self) -> list:
+        """PIDs for the ollama server process."""
+        serve = []
+        try:
+            result = subprocess.run(
+                ["pgrep", "-a", "-x", "ollama"],
+                capture_output=True, text=True, timeout=5,
+            )
+            for line in result.stdout.splitlines():
+                # "12345 ollama serve" or "12345 /usr/local/bin/ollama serve"
+                if "serve" in line:
+                    parts = line.split(None, 1)
+                    if parts and parts[0].isdigit():
+                        serve.append(int(parts[0]))
+        except Exception:
+            pass
+        return serve or self._find_ollama_binary_pids()
+
+    def _systemctl(self, action: str) -> bool:
+        """Try system / user / passwordless-sudo systemctl for unit ollama."""
+        candidates = [
+            ["systemctl", action, "ollama"],
+            ["systemctl", "--user", action, "ollama"],
+            ["sudo", "-n", "systemctl", action, "ollama"],
+        ]
+        for cmd in candidates:
+            try:
+                r = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=45,
+                )
+                if r.returncode == 0:
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _port_listening_all_interfaces(self) -> Optional[bool]:
+        """True if something listens on 0.0.0.0:11434 / *:11434, False if only 127.0.0.1, None unknown."""
+        try:
+            r = subprocess.run(
+                ["ss", "-ltn"], capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode != 0:
+                return None
+            bind_hit = False
+            loop_only = False
+            for line in r.stdout.splitlines():
+                if ":11434" not in line:
+                    continue
+                if "0.0.0.0:11434" in line or "*:11434" in line or "[::]:11434" in line:
+                    bind_hit = True
+                if "127.0.0.1:11434" in line or "[::1]:11434" in line:
+                    loop_only = True
+            if bind_hit:
+                return True
+            if loop_only:
+                return False
+            return None
+        except Exception:
+            return None
+
+    def _wait_until(self, want_running: bool, seconds: int = 30) -> bool:
+        import time
+        for _ in range(seconds):
+            ok = self._api_ok()
+            if want_running and ok:
+                return True
+            if not want_running and not ok and not self._find_serve_pids():
+                return True
+            time.sleep(1)
+        return self._api_ok() if want_running else (not self._api_ok())
+
+    def _kill_processes(self, force: bool = False) -> None:
+        """Kill only the real ollama binary — never match `python cli.py ollama`."""
+        sig = 9 if force else 15
+        # Exact process name (safe)
+        try:
+            subprocess.run(
+                ["pkill", f"-{sig}", "-x", "ollama"],
+                capture_output=True, text=True, timeout=10,
+            )
+        except Exception:
+            pass
+        # Direct kill of any remaining ollama binary PIDs
+        for pid in self._find_ollama_binary_pids():
+            try:
+                os.kill(pid, sig)
+            except Exception:
+                pass
+
+    # ── public API ───────────────────────────────────────────────────
 
     def status(self) -> Dict[str, Any]:
-        """Get current Ollama service status.
-
-        Returns:
-            Dict with keys: running (bool), models (list), pid (int|None),
-            gpu (bool), memory_mb (float|None)
-        """
+        """Get current Ollama service status."""
         info: Dict[str, Any] = {
             "running": False,
             "models": [],
             "pid": None,
             "gpu": False,
             "memory_mb": None,
+            "bind": self.bind,
+            "client": self.host,
+            "listen_all": None,
+            "via_systemd": False,
         }
 
-        # Check if Ollama is responding
+        if self._api_ok():
+            info["running"] = True
+            info["models"] = self._list_models()
+
+        pids = self._find_serve_pids()
+        if pids:
+            info["pid"] = pids[0]
+
+        info["listen_all"] = self._port_listening_all_interfaces()
+
         try:
-            req = urllib.request.Request(
-                f"{self.host}/api/tags",
-                headers={"Content-Type": "application/json"},
+            r = subprocess.run(
+                ["systemctl", "is-active", "ollama"],
+                capture_output=True, text=True, timeout=5,
             )
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                info["running"] = True
-                info["models"] = [m["name"] for m in data.get("models", [])]
+            info["via_systemd"] = r.stdout.strip() == "active"
         except Exception:
             pass
 
-        # Find Ollama process
         try:
             result = subprocess.run(
-                ["pgrep", "-f", "ollama"],
+                [
+                    "nvidia-smi",
+                    "--query-compute-apps=pid,used_memory",
+                    "--format=csv,noheader,nounits",
+                ],
                 capture_output=True, text=True, timeout=5,
             )
-            if result.returncode == 0 and result.stdout.strip():
-                pids = result.stdout.strip().split("\n")
-                info["pid"] = int(pids[0])  # Primary PID
-        except Exception:
-            pass
-
-        # Check GPU usage (nvidia-smi)
-        try:
-            result = subprocess.run(
-                ["nvidia-smi",
-                 "--query-compute-apps=pid,used_memory",
-                 "--format=csv,noheader,nounits"],
-                capture_output=True, text=True, timeout=5,
-            )
-            if result.returncode == 0:
+            if result.returncode == 0 and info["pid"]:
                 for line in result.stdout.strip().split("\n"):
-                    parts = line.strip().split(",")
+                    parts = [p.strip() for p in line.strip().split(",")]
                     if len(parts) >= 2:
-                        pid_str = parts[0].strip()
-                        mem_str = parts[1].strip()
                         try:
-                            pid = int(pid_str)
-                            mem = float(mem_str)
-                            if info["pid"] and pid == info["pid"]:
+                            if int(parts[0]) == info["pid"]:
                                 info["gpu"] = True
-                                info["memory_mb"] = mem
+                                info["memory_mb"] = float(parts[1])
                         except (ValueError, TypeError):
                             pass
         except Exception:
@@ -326,134 +476,151 @@ class OllamaServiceManager:
         return info
 
     def stop(self) -> Dict[str, Any]:
-        """Stop the Ollama service.
-
-        Returns:
-            Dict with keys: success (bool), message (str)
-        """
-        # First check if it's running
-        status = self.status()
-        if not status["running"] and not status["pid"]:
-            return {"success": True, "message": "Ollama is not running"}
-
-        # Try graceful shutdown via API first (Ollama doesn't have a
-        # shutdown endpoint, so we go straight to process management)
-
-        # Kill the ollama serve process
-        try:
-            result = subprocess.run(
-                ["pkill", "-f", "ollama serve"],
-                capture_output=True, text=True, timeout=10,
-            )
-        except Exception:
-            pass
-
-        # Also kill any ollama runner processes (model inference)
-        try:
-            subprocess.run(
-                ["pkill", "-f", "ollama runner"],
-                capture_output=True, text=True, timeout=10,
-            )
-        except Exception:
-            pass
-
-        # Also try the main ollama process
-        try:
-            subprocess.run(
-                ["pkill", "-x", "ollama"],
-                capture_output=True, text=True, timeout=10,
-            )
-        except Exception:
-            pass
-
-        # Wait briefly and verify
+        """Stop Ollama: systemd unit first, then processes. Waits until dead."""
         import time
-        time.sleep(2)
-        new_status = self.status()
-        if not new_status["running"]:
-            return {"success": True, "message": "Ollama stopped successfully"}
-        else:
-            # Force kill
-            try:
-                subprocess.run(
-                    ["pkill", "-9", "-f", "ollama"],
-                    capture_output=True, text=True, timeout=10,
-                )
-                time.sleep(1)
-                return {"success": True, "message": "Ollama force-stopped"}
-            except Exception as e:
-                return {"success": False, "message": f"Failed to stop Ollama: {e}"}
 
-    def start(self, model: Optional[str] = None) -> Dict[str, Any]:
-        """Start the Ollama service.
+        had_something = self._api_ok() or bool(self._find_serve_pids())
+        # Stop systemd so Restart=always does not immediately revive it
+        self._systemctl("stop")
+        time.sleep(0.5)
+        self._kill_processes(force=False)
+        if not self._wait_until(want_running=False, seconds=8):
+            self._kill_processes(force=True)
+            self._wait_until(want_running=False, seconds=5)
 
-        Args:
-            model: Optional model to pre-load (e.g. 'cogito:14b').
+        if self._api_ok() or self._find_serve_pids():
+            return {
+                "success": False,
+                "message": "Failed to stop Ollama (process still alive — try: systemctl stop ollama)",
+            }
+        if not had_something:
+            return {"success": True, "message": "Ollama is not running"}
+        return {"success": True, "message": "Ollama stopped successfully"}
 
-        Returns:
-            Dict with keys: success (bool), message (str)
+    def start(self, model: Optional[str] = None, force_bind: bool = True) -> Dict[str, Any]:
+        """Start ollama serve bound to ``self.bind`` (default 0.0.0.0:11434).
+
+        If something is already running only on 127.0.0.1 and force_bind is
+        True, it is stopped and restarted so we listen on all interfaces.
         """
-        # Check if already running
+        import time
+
         status = self.status()
         if status["running"]:
-            return {"success": True, "message": "Ollama is already running"}
+            listen_all = status.get("listen_all")
+            if force_bind and listen_all is False:
+                # Wrong bind — recycle
+                self.stop()
+            else:
+                msg = f"Ollama is already running on {self.host}"
+                if listen_all:
+                    msg += " (listening on 0.0.0.0:11434)"
+                if model:
+                    self._preload_model(model)
+                return {
+                    "success": True,
+                    "message": msg,
+                    "models": status.get("models", []),
+                }
 
-        # Start ollama serve in the background
+        # Prefer a DocForge-owned process with explicit bind. Systemd unit on
+        # this machine often has no OLLAMA_HOST and sticks to 127.0.0.1.
+        self._systemctl("stop")  # avoid port fight / auto-restart
+        time.sleep(0.5)
+
+        env = os.environ.copy()
+        env["OLLAMA_HOST"] = self.bind
+        # Prefer the system model store (systemd runs as user ollama) when readable
+        system_models = "/usr/share/ollama/.ollama/models"
+        if "OLLAMA_MODELS" not in env and os.path.isdir(system_models):
+            if os.access(system_models, os.R_OK):
+                env["OLLAMA_MODELS"] = system_models
+
         try:
             subprocess.Popen(
                 ["ollama", "serve"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
+                env=env,
             )
         except FileNotFoundError:
-            return {"success": False, "message": "Ollama not found. Install it from https://ollama.ai"}
+            return {
+                "success": False,
+                "message": "Ollama not found. Install it from https://ollama.ai",
+            }
         except Exception as e:
             return {"success": False, "message": f"Failed to start Ollama: {e}"}
 
-        # Wait for it to come up
-        import time
-        for attempt in range(30):  # 30 seconds max
-            time.sleep(1)
-            status = self.status()
-            if status["running"]:
-                break
+        if not self._wait_until(want_running=True, seconds=45):
+            # Fallback: systemd unit (may only bind localhost)
+            if self._systemctl("start") and self._wait_until(want_running=True, seconds=20):
+                status = self.status()
+                return {
+                    "success": True,
+                    "message": (
+                        "Ollama started via systemd "
+                        f"(API {self.host}; bind may be 127.0.0.1 only — "
+                        f"set OLLAMA_HOST={self.bind} in the unit for all interfaces)"
+                    ),
+                    "models": status.get("models", []),
+                }
+            return {
+                "success": False,
+                "message": f"Ollama failed to start within 45s (wanted bind {self.bind})",
+            }
 
-        if not status["running"]:
-            return {"success": False, "message": "Ollama failed to start within 30 seconds"}
-
-        # Pre-load model if specified
         if model:
-            try:
-                subprocess.run(
-                    ["ollama", "run", model, "--keep-alive", "5m", ""],
-                    capture_output=True, text=True, timeout=120,
-                )
-            except Exception:
-                pass  # Model load failed but Ollama is running
+            self._preload_model(model)
 
+        status = self.status()
+        listen = status.get("listen_all")
+        listen_note = (
+            "listening on 0.0.0.0:11434"
+            if listen
+            else f"API up at {self.host}"
+        )
         return {
             "success": True,
-            "message": f"Ollama started successfully{' (loaded ' + model + ')' if model else ''}",
+            "message": (
+                f"Ollama started ({listen_note}, OLLAMA_HOST={self.bind})"
+                + (f", preloaded {model}" if model else "")
+            ),
             "models": status.get("models", []),
         }
 
+    def _preload_model(self, model: str) -> None:
+        try:
+            env = os.environ.copy()
+            env["OLLAMA_HOST"] = self.host.replace("http://", "").replace("https://", "")
+            # Client talk to loopback
+            env["OLLAMA_HOST"] = self.host.split("://", 1)[-1]
+            subprocess.run(
+                ["ollama", "run", model, "--keep-alive", "5m", ""],
+                capture_output=True, text=True, timeout=180, env=env,
+            )
+        except Exception:
+            pass
+
     def restart(self, model: Optional[str] = None) -> Dict[str, Any]:
-        """Stop and restart the Ollama service.
-
-        Args:
-            model: Optional model to pre-load after restart.
-
-        Returns:
-            Dict with keys: success (bool), message (str)
-        """
+        """Hard stop then start with bind 0.0.0.0:11434."""
         stop_result = self.stop()
-        # Always try to start, even if stop reported not running
-        start_result = self.start(model=model)
+        start_result = self.start(model=model, force_bind=True)
         return {
             "success": start_result["success"],
-            "message": f"Restart: stop=({stop_result['message']}), start=({start_result['message']})",
+            "message": (
+                f"Restart complete — stop: {stop_result['message']}; "
+                f"start: {start_result['message']}"
+            ),
+            "models": start_result.get("models", []),
         }
+
+    def ensure_fresh(self, model: Optional[str] = None) -> Dict[str, Any]:
+        """Stop any existing Ollama and start clean on 0.0.0.0:11434.
+
+        Intended for DocForge app / CLI session bootstrap.
+        """
+        return self.restart(model=model)
 
 
 # ──────────────────────────────────────────────────────────────────────

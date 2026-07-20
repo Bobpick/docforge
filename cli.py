@@ -266,9 +266,9 @@ def ollama():
     pass
 
 
-@ollama.command()
-@click.option("--host", default="http://localhost:11434", help="Ollama host URL")
-def status(host):
+@ollama.command("status")
+@click.option("--host", default="http://127.0.0.1:11434", help="Ollama API URL")
+def ollama_status(host):
     """Check Ollama service status."""
     mgr = OllamaServiceManager(host=host)
     info = mgr.status()
@@ -277,6 +277,9 @@ def status(host):
         click.echo(click.style("  🟢 Ollama is running", fg="green", bold=True))
         if info.get("pid"):
             click.echo(f"  PID: {info['pid']}")
+        click.echo(f"  Bind: {info.get('bind')}  (listen_all={info.get('listen_all')})")
+        click.echo(f"  API:  {info.get('client')}")
+        click.echo(f"  systemd active: {info.get('via_systemd')}")
         if info.get("models"):
             click.echo(f"  Models: {', '.join(info['models'])}")
         if info.get("gpu"):
@@ -285,16 +288,16 @@ def status(host):
             click.echo("  GPU: No (CPU mode)")
     else:
         click.echo(click.style("  🔴 Ollama is not running", fg="red", bold=True))
-        click.echo("  Start with: docforge ollama start")
+        click.echo("  Start with: python cli.py ollama start")
 
 
-@ollama.command()
-@click.option("--host", default="http://localhost:11434", help="Ollama host URL")
+@ollama.command("start")
+@click.option("--host", default="http://127.0.0.1:11434", help="Ollama API URL")
 @click.option("--model", default=None, help="Model to pre-load (e.g. cogito:14b)")
-def start(host, model):
-    """Start the Ollama service."""
+def ollama_start(host, model):
+    """Start Ollama on 0.0.0.0:11434."""
     mgr = OllamaServiceManager(host=host)
-    result = mgr.start(model=model)
+    result = mgr.start(model=model, force_bind=True)
 
     if result["success"]:
         click.echo(click.style(f"  ✅ {result['message']}", fg="green", bold=True))
@@ -305,10 +308,10 @@ def start(host, model):
         sys.exit(1)
 
 
-@ollama.command()
-@click.option("--host", default="http://localhost:11434", help="Ollama host URL")
-def stop(host):
-    """Stop the Ollama service (frees GPU/RAM)."""
+@ollama.command("stop")
+@click.option("--host", default="http://127.0.0.1:11434", help="Ollama API URL")
+def ollama_stop(host):
+    """Stop the Ollama service (systemd + processes)."""
     mgr = OllamaServiceManager(host=host)
     result = mgr.stop()
 
@@ -319,11 +322,11 @@ def stop(host):
         sys.exit(1)
 
 
-@ollama.command()
-@click.option("--host", default="http://localhost:11434", help="Ollama host URL")
+@ollama.command("restart")
+@click.option("--host", default="http://127.0.0.1:11434", help="Ollama API URL")
 @click.option("--model", default=None, help="Model to pre-load after restart")
-def restart(host, model):
-    """Restart the Ollama service."""
+def ollama_restart(host, model):
+    """Stop everything, then start on 0.0.0.0:11434."""
     mgr = OllamaServiceManager(host=host)
     result = mgr.restart(model=model)
 
