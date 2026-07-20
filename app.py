@@ -147,7 +147,7 @@ def _convert_one_file(
 
     try:
         start = time.time()
-        result = forge.convert(tmp_path, output_dir=output_dir)
+        result = forge.convert(tmp_path, output_dir=output_dir, source_name=uploaded_file.name)
         elapsed = time.time() - start
 
         # Collect image bytes for ZIP download

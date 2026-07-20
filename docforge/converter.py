@@ -148,12 +148,16 @@ class DocForge:
         self,
         file_path: str,
         output_dir: Optional[str] = None,
+        source_name: Optional[str] = None,
     ) -> ConversionResult:
         """Convert a single document to Markdown + JSON.
 
         Args:
             file_path: Path to the source document.
             output_dir: If given, automatically save results to this directory.
+            source_name: Override for the source file name in metadata.
+                         Useful when the actual file is a temp file but you
+                         want to preserve the original upload name.
 
         Returns:
             A ConversionResult with markdown, structured JSON, images, metadata.
@@ -185,10 +189,11 @@ class DocForge:
 
         # --- Finalize ---
         structured["markdown"] = markdown
+        display_name = source_name or path.name
         structured["metadata"] = {
             **metadata,
             "conversion_date": datetime.now().isoformat(),
-            "source_file": path.name,
+            "source_file": display_name,
             "use_llm": self.use_llm,
             "artifacts_removed": self.remove_artifacts,
             "conversion_time_seconds": round(time.time() - start, 2),

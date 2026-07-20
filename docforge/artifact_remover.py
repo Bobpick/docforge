@@ -117,8 +117,13 @@ class ArtifactRemover:
         return False
 
     def _remove_artifact_patterns(self, lines: list) -> list:
-        """Remove common artifact patterns like 'Confidential', 'Draft', etc."""
+        """Remove common artifact patterns like 'Confidential', 'Draft', etc.
+
+        Also removes web-printed page chrome (Google Patents, etc.) and
+        common PDF reader artifacts.
+        """
         artifact_patterns = [
+            # Standard document artifacts
             r'(?i)^\s*draft\b.*$',
             r'(?i)^\s*confidential\b.*$',
             r'(?i)^\s*do\s+not\s+distribute\b.*$',
@@ -129,6 +134,30 @@ class ArtifactRemover:
             r'(?i)^\s*not\s+for\s+(distribution|publication|release)\b.*$',
             r'(?i)^\s*for\s+internal\s+use\b.*$',
             r'(?i)^\s*trade\s+secret\b.*$',
+            # Web-printed page chrome (Google Patents, Google Scholar, etc.)
+            r'(?i)^\s*Download\s+PDF\b.*$',
+            r'(?i)^\s*Find\s+Prior\s+Art\b.*$',
+            r'(?i)^\s*Similar\s*$',
+            r'(?i)^\s*Show\s+more\s*$',
+            r'(?i)^\s*Send\s+Feedback\s*$',
+            r'(?i)^\s*About\s*$',
+            r'(?i)^\s*Public\s+Datasets\b.*$',
+            r'(?i)^\s*Terms\s*$',
+            r'(?i)^\s*Privacy\s+Policy\s*$',
+            r'(?i)^\s*Help\s*$',
+            r'(?i)^\s*View\s+\d+\s+more\s+classifications?\s*$',
+            r'(?i)^\s*\*\s*Cited\s+by\s+examiner.*$',
+            r'(?i)^\s*Family\s+To\s+Family\s+Citations\s*$',
+            r'(?i)^\s*Data\s+provided\s+by\b.*$',
+            # Google Patents page counters
+            r'^\s*\d+\s+of\s+\d+\s*$',
+            # Patent document patterns
+            r'(?i)^\s*Sheet\s+\d+\s+of\s+\d+\s*$',
+            r'^\s*US\d+[A-Z]\s*$',  # Patent number standalone
+            # Web page URL footers
+            r'^\s*https?://\S+\s*$',
+            # Page indicators from print
+            r'^\s*\d{1,2}/\d{1,2}/\d{2,4},?\s*\d{1,2}:\d{2}\s*$',
         ]
         
         cleaned = []
