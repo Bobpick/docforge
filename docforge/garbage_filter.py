@@ -203,7 +203,7 @@ def strip_garbage_markdown_tables(markdown: str) -> str:
 
 def _md_table_is_garbage(block: List[str]) -> bool:
     rows_raw = [ln for ln in block if ln.strip().startswith("|")]
-    if len(rows_raw) < 2:
+    if len(rows_raw) < 1:
         return True
     parsed: List[List[str]] = []
     for ln in rows_raw:
@@ -213,6 +213,13 @@ def _md_table_is_garbage(block: List[str]) -> bool:
         parsed.append(cells)
     if not parsed:
         return True
+    # Incomplete / single-row pipe soup (common after partial filters)
+    if len(parsed) == 1:
+        width = len(parsed[0])
+        frag = sum(1 for c in parsed[0] if is_fragment_cell(c))
+        if width >= 6 or frag >= max(2, width // 3):
+            return True
+        return width >= 4 and frag >= 2
     headers, body = parsed[0], parsed[1:]
     return is_garbage_table(headers, body)
 
